@@ -121,12 +121,60 @@ public enum HerdrError: LocalizedError {
 
 public enum HerdrClient {
 
+    // MARK: - Socket path
+
+    /// The socket every request and stream connects to, read afresh on each
+    /// connection so a target switch takes effect without rebuilding anyone.
+    ///
+    /// 1. `HERDR_SOCKET_PATH` — a developer override, so it beats everything,
+    ///    including a remote target picked in the app.
+    /// 2. The path set with `setSocketPath` — the local end of an SSH tunnel
+    ///    to a remote Herdr.
+    /// 3. Herdr's own default under `$XDG_CONFIG_HOME` or `~/.config`.
     public static func socketPath() -> String {
-        let env = ProcessInfo.processInfo.environment
+        resolveSocketPath(
+            environment: ProcessInfo.processInfo.environment,
+            override: socketOverride.value
+        )
+    }
+
+    /// Points every Herdr call at another socket; nil restores the local
+    /// default. A process-wide setting rather than an injected client because
+    /// only one target exists at a time, and threading a client through the
+    /// tune controller and panels would buy nothing. Requests already in
+    /// flight keep their old connection and may fail — the bridge tears its
+    /// Herdr side down before switching, so nothing long-lived is stranded.
+    public static func setSocketPath(_ path: String?) {
+        socketOverride.value = path.flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// `HERDR_SOCKET_PATH`, if set and non-empty. While it is, `setSocketPath`
+    /// has no effect, so the app should not offer a target choice at all.
+    public static var environmentOverride: String? {
+        ProcessInfo.processInfo.environment["HERDR_SOCKET_PATH"].flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// The precedence of `socketPath()` with its inputs passed in, so it can
+    /// be tested without touching the process environment.
+    static func resolveSocketPath(environment env: [String: String], override: String?) -> String {
         if let explicit = env["HERDR_SOCKET_PATH"], !explicit.isEmpty { return explicit }
+        if let override { return override }
         let base = env["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : $0 }
             ?? (NSHomeDirectory() as NSString).appendingPathComponent(".config")
         return (base as NSString).appendingPathComponent("herdr/herdr.sock")
+    }
+
+    private static let socketOverride = LockedPath()
+
+    /// Written from the main actor on a target switch, read from whichever
+    /// thread opens a connection.
+    private final class LockedPath: @unchecked Sendable {
+        private var path: String?
+        private let lock = NSLock()
+        var value: String? {
+            get { lock.lock(); defer { lock.unlock() }; return path }
+            set { lock.lock(); defer { lock.unlock() }; path = newValue }
+        }
     }
 
     // MARK: - Requests
