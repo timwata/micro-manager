@@ -29,18 +29,39 @@ numbers (§) refer to that document.
 Branch `feat/remote-herdr-1-config` · PR title `feat: herdr target config and socket override`
 · No user-visible change.
 
-- [ ] Add `Sources/WLKit/HerdrTarget.swift` with `HerdrRemote`, `HerdrTarget`,
+- [x] Add `Sources/WLKit/HerdrTarget.swift` with `HerdrRemote`, `HerdrTarget`,
       `HerdrRemotes.load()` / `parse(_:)` (§2).
-  - [ ] Skip entries without non-empty `name`/`host`; keep first of duplicate
+  - [x] Skip entries without non-empty `name`/`host`; keep first of duplicate
         names; malformed or absent → `[]`.
-  - [ ] `load()` reads `KeyBindings.configPath()`.
-- [ ] `HerdrClient`: add lock-protected `setSocketPath(_:)`,
+  - [x] `load()` reads `KeyBindings.configPath()`.
+- [x] `HerdrClient`: add lock-protected `setSocketPath(_:)`,
       `environmentOverride`, and the 3-level precedence in `socketPath()` (§3).
-- [ ] Tests: `Tests/WLKitTests/HerdrRemotesTests.swift` (valid, missing
+- [x] Tests: `Tests/WLKitTests/HerdrRemotesTests.swift` (valid, missing
       fields, duplicates, malformed, absent key, default socket).
-- [ ] Tests: socket path precedence (set → used; `nil` → XDG default; skip
+- [x] Tests: socket path precedence (set → used; `nil` → XDG default; skip
       the env case when `HERDR_SOCKET_PATH` is set).
-- [ ] `swift test` green.
+- [x] `swift test` green.
+
+Notes (small additions beyond the design, no deviation in behaviour):
+
+- `HerdrRemote` also has a memberwise `public init` and `remoteSocket`
+  (`socket ?? defaultSocket`) for Phase 2 to forward to.
+- "Non-empty" means not blank after trimming whitespace, and the trimmed
+  value is what is kept (so `"box "` and `"box"` are duplicates); an empty
+  `socket` is treated as absent (default path).
+- A `host` starting with `-` is skipped: ssh would read it as an option.
+- A blank `setSocketPath`, override or `HERDR_SOCKET_PATH` counts as unset,
+  in both `setSocketPath` and `resolveSocketPath`.
+- `setSocketPath` bumps a generation counter on every actual change;
+  `HerdrClient.request` turns a reply that arrives after a switch into
+  `HerdrError.targetChanged` instead of delivering the old target's data.
+  Tested against a fake socket server.
+- `HerdrEventStream` resolves the socket path in `start()`, not `init`.
+- The precedence lives in an internal pure
+  `resolveSocketPath(environment:override:)`, so the env-wins case is tested
+  without touching the process environment
+  (`Tests/WLKitTests/HerdrSocketPathTests.swift`). Only the two tests of the
+  real process-wide setting skip under `HERDR_SOCKET_PATH`.
 
 ## Phase 2 — SSH tunnel
 
@@ -49,7 +70,8 @@ Branch `feat/remote-herdr-2-tunnel` · PR title `feat: ssh tunnel to a remote he
 
 - [ ] Add `Sources/WLKit/SSHTunnel.swift` (§4).
   - [ ] Pure `arguments(host:localSocket:remoteSocket:)` with every option in
-        §4.1, ending in `<host> cat >/dev/null`.
+        §4.1, ending in `-- <host> cat >/dev/null` (the `--` keeps a host
+        starting with `-` from being read as an option).
   - [ ] Pure local socket path builder (`$TMPDIR/mm-<sanitized>.sock`,
         < 104 bytes) (§4.2).
   - [ ] Remote `~/` expansion via `ssh … printenv HOME`, cached per host, 10 s
