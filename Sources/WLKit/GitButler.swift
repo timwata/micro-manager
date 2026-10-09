@@ -10,8 +10,11 @@ import Foundation
 public enum GitButler {
 
     public struct StatusOutput: Sendable {
-        /// Combined stdout and stderr, still carrying its ANSI escapes.
+        /// Combined stdout and stderr, still carrying its ANSI escapes. Only
+        /// stdout when the streams were run separately.
         public var text: String
+        /// stderr when the streams were run separately; empty when merged.
+        public var errorText: String = ""
         public var succeeded: Bool
         public var directory: String
     }
@@ -68,6 +71,21 @@ public enum GitButler {
     /// asdf, nvm-style installs that only exist once a profile has been read.
     private static func askLoginShell() -> String? {
         let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        return askLoginShell(shell, timeout: 10)
+    }
+
+    /// A profile that blocks (a prompt, a hung network mount) must not stall
+    /// Stack and Land forever, so the answer is waited for, not the shell. On
+    /// timeout the shell is terminated and the lookup gives up with `nil`,
+    /// which is not cached, so the next press asks again.
+    ///
+    /// The wait has to be on the read, not on the shell. `terminate()` takes
+    /// down the shell's process group, but a child that left it (a job started
+    /// with job control, a daemon) keeps the pipe open, and a shell stuck in
+    /// the kernel on a hung mount does not die until the call returns. Either
+    /// way, reading to EOF after `terminate()` could still block. That reader
+    /// is left behind on a global queue and finishes when the pipe closes.
+    static func askLoginShell(_ shell: String, timeout: TimeInterval) -> String? {
         guard FileManager.default.isExecutableFile(atPath: shell) else { return nil }
 
         let process = Process()
@@ -76,16 +94,27 @@ public enum GitButler {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
+        // A profile that reads the terminal gets EOF instead of waiting.
+        process.standardInput = FileHandle.nullDevice
 
         do {
             try process.run()
         } catch {
             return nil
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+        let output = DataBox()
+        let drained = DispatchGroup()
+        DispatchQueue.global().async(group: drained) {
+            output.value = pipe.fileHandleForReading.readDataToEndOfFile()
+        }
+        guard drained.wait(timeout: .now() + timeout) == .success else {
+            if process.isRunning { process.terminate() }
+            return nil
+        }
         process.waitUntilExit()
 
-        let path = String(decoding: data, as: UTF8.self)
+        let path = String(decoding: output.value, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty, FileManager.default.isExecutableFile(atPath: path) else { return nil }
         return path
@@ -110,12 +139,23 @@ public enum GitButler {
     /// Applied branches in landing order: bottom-most first within each stack,
     /// branches already integrated into the target skipped.
     public static func landPlan(in directory: String, timeout: TimeInterval = 15) async throws -> [String] {
+        guard let binary = locateBinary() else { throw Failure.binaryNotFound }
+        return try await landPlan(in: directory, binary: binary, timeout: timeout)
+    }
+
+    /// The streams are kept apart here: a single line on stderr (an update
+    /// notice, a deprecation warning) would otherwise land in the middle of
+    /// the JSON and fail the whole land. stderr still matters on failure,
+    /// since that is where `but` says what went wrong.
+    static func landPlan(in directory: String, binary: String, timeout: TimeInterval) async throws -> [String] {
         let output = try await run(
-            ["status", "--json"], in: directory, color: false, timeout: timeout
+            binary, ["status", "--json"], in: directory,
+            color: false, separateStderr: true, timeout: timeout
         )
         guard output.succeeded else {
+            let error = output.errorText.trimmingCharacters(in: .whitespacesAndNewlines)
             throw Failure.commandFailed(
-                output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                error.isEmpty ? output.text.trimmingCharacters(in: .whitespacesAndNewlines) : error
             )
         }
         return try parseLandPlan(Data(output.text.utf8))
@@ -181,12 +221,26 @@ public enum GitButler {
         timeout: TimeInterval = 15
     ) async throws -> StatusOutput {
         guard let binary = locateBinary() else { throw Failure.binaryNotFound }
-        return try await withCheckedThrowingContinuation { continuation in
+        return try await run(
+            binary, arguments, in: directory,
+            color: color, separateStderr: false, timeout: timeout
+        )
+    }
+
+    private static func run(
+        _ binary: String,
+        _ arguments: [String],
+        in directory: String,
+        color: Bool,
+        separateStderr: Bool,
+        timeout: TimeInterval
+    ) async throws -> StatusOutput {
+        try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let output = try launch(
                         binary, arguments: arguments, in: directory,
-                        color: color, timeout: timeout
+                        color: color, separateStderr: separateStderr, timeout: timeout
                     )
                     continuation.resume(returning: output)
                 } catch {
@@ -196,11 +250,12 @@ public enum GitButler {
         }
     }
 
-    private static func launch(
+    static func launch(
         _ binary: String,
         arguments: [String],
         in directory: String,
         color: Bool,
+        separateStderr: Bool,
         timeout: TimeInterval
     ) throws -> StatusOutput {
         let process = Process()
@@ -222,11 +277,13 @@ public enum GitButler {
         ].joined(separator: ":")
         process.environment = environment
 
-        // One pipe for both streams: it keeps the error text interleaved where
-        // it belongs, and sidesteps the deadlock of draining two pipes in turn.
+        // Output shown to the user (`status`, `land`) gets one pipe for both
+        // streams: it keeps the error text interleaved where it belongs.
+        // Output parsed by us gets stderr on a pipe of its own.
         let pipe = Pipe()
+        let errorPipe = separateStderr ? Pipe() : nil
         process.standardOutput = pipe
-        process.standardError = pipe
+        process.standardError = errorPipe ?? pipe
 
         do {
             try process.run()
@@ -239,15 +296,34 @@ public enum GitButler {
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
+        // stderr is drained while stdout is read, not after it: once either
+        // pipe's buffer fills, `but` blocks writing to it, and a reader stuck
+        // waiting for EOF on the other one never gets there.
+        let errorOutput = DataBox()
+        let drained = DispatchGroup()
+        if let errorPipe {
+            DispatchQueue.global().async(group: drained) {
+                errorOutput.value = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            }
+        }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        drained.wait()
         process.waitUntilExit()
         watchdog.cancel()
 
         return StatusOutput(
             text: String(decoding: data, as: UTF8.self),
+            errorText: String(decoding: errorOutput.value, as: UTF8.self),
             succeeded: process.terminationStatus == 0,
             directory: directory
         )
+    }
+
+    /// Hands bytes read on another queue back to the waiting one. The
+    /// `DispatchGroup` wait is the happens-before edge, so the box itself
+    /// needs no lock.
+    private final class DataBox: @unchecked Sendable {
+        var value = Data()
     }
 
     /// Resolving through a login shell costs a shell startup, so hold onto the
