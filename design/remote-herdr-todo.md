@@ -247,29 +247,70 @@ Notes (additions beyond the design):
 Branch `feat/remote-herdr-4-ui` · PR title `feat: pick a remote herdr from the menu bar`
 · The feature ships with this PR, so docs ship with it too.
 
-- [ ] `BridgeSettings.targetName` + `resolvedTarget()` (env override or unknown
+- [x] `BridgeSettings.targetName` + `resolvedTarget()` (env override or unknown
       name → `.local`) (§2, §6.3).
-- [ ] Launch: `setTarget(BridgeSettings.resolvedTarget())` after
+- [x] Launch: `setTarget(BridgeSettings.resolvedTarget())` after
       `useEmulator`, before `start()` (§6.3).
-- [ ] `MenuPanelView` target row: picker (This Mac + remotes), link status
+- [x] `MenuPanelView` target row: picker (This Mac + remotes), link status
       line, reload remotes `.onAppear`, disabled with caption under
       `HERDR_SOCKET_PATH`, hint when no remotes (§6.1).
-- [ ] `keyView`: stack/land disabled with "Not available for a remote Herdr"
+- [x] `keyView`: stack/land disabled with "Not available for a remote Herdr"
       help when remote; subtitle " · via <name>" (§6.1).
-- [ ] Footer "Edit Config…" (create `{}` + dir if missing, then open) (§6.2).
-- [ ] Close Stack/Land panels when `bridge.target` changes (§6.4).
-- [ ] `applicationWillTerminate` → `bridge.shutdownTunnel()` (§6.5).
-- [ ] `MenuBarIcon`: grey dot when remote link is connecting/failed; help
+- [x] Footer "Edit Config…" (create `{}` + dir if missing, then open) (§6.2).
+- [x] Close Stack/Land panels when `bridge.target` changes (§6.4).
+- [x] `applicationWillTerminate` → `bridge.shutdownTunnel()` (§6.5).
+- [x] `MenuBarIcon`: grey dot when remote link is connecting/failed; help
       suffix " (via <name>)" (§6.6).
-- [ ] README "Configuration": `remotes` block, key/agent auth requirement
+- [x] README "Configuration": `remotes` block, key/agent auth requirement
       (BatchMode), Stack/Land disabled remotely, `HERDR_SOCKET_PATH` disables
       the picker.
-- [ ] CLAUDE.md "Things that are easy to get wrong": one line on the owned ssh
+- [x] CLAUDE.md "Things that are easy to get wrong": one line on the owned ssh
       (`ControlMaster=no`, stdin-EOF lifetime) and the env override.
 - [ ] Manual (with `WL_EMULATE=1` and a real host): switch This Mac ↔ remote ↔
       second remote; kill the ssh process → reconnects; bad host → readable
       error; quit → no ssh left; relaunch → last target restored.
-- [ ] `swift test` green; `./scripts/bundle.sh` succeeds.
+- [x] `swift test` green; `./scripts/bundle.sh` succeeds.
+
+Notes (additions beyond the design):
+
+- `HerdrRemotes.target(named:in:)` (pure, tested) does the name lookup for
+  `resolvedTarget()` and the picker; `HerdrTarget.remoteName` is the
+  persisted form (nil = This Mac).
+- §6.4 is wired through a bridge callback, `onTargetChange`, set in the
+  app's `.task` like `onStackKey`/`onLandKey`, rather than by observing
+  `bridge.target` from a view: the panel view need not be on screen when the
+  target changes. A land that is already **running** is not closed — it
+  pushes this Mac's repository whatever the pad shows, and its window is the
+  only place its outcome appears (`LandPanelController.closeForTargetChange`).
+- `BridgeController.reconnect()` and a **Retry** button next to a failed link.
+  §7 says a permanent failure is shown "until the user changes something and
+  re-selects the target", but `setTarget` ignores the same target, so without
+  this the only way back after fixing a key was off/on or switching away and
+  back. It restarts the tunnel only when the link is `.failed`.
+- Opening the panel re-reads the config (`.onAppear`, plus
+  `NSWindow.didBecomeKeyNotification` in case the menu window is kept alive
+  between openings). A remote edited in place under the selected name is
+  re-applied; a selected remote removed from the config stays selected (and
+  listed) until the user picks another, and falls back to This Mac on the
+  next launch.
+- "Edit Config…" sits on the "Emulate the pad" row, still in the footer: the
+  button row (Refresh, Inspector, Quit) has no room for a fourth push button
+  at the panel's 300 pt width (measured ~330 pt). A Mac with no app for
+  `.json` gets TextEdit.
+- `MenuBarIcon.State.linkDown` (badge symbol + grey dot, like
+  `.deviceMissing`), checked after the device states and before the agent
+  states. The " (via <name>)" suffix goes on the image's accessibility
+  description, which is where the state's help text already went.
+- Herdr exports `HERDR_SOCKET_PATH` into every pane it runs, so `swift run`
+  from inside Herdr gets the disabled picker; launch with
+  `env -u HERDR_SOCKET_PATH` to develop against the picker.
+
+Manual check so far: headless runs (no clicking — this session has no
+accessibility access) showed that the app's `.task`, which holds all the
+wiring including the launch `setTarget` and auto-start, runs only once the
+menu-bar panel is first opened, on `main` too: a fresh launch opens no Herdr
+socket and no ssh until then. Not changed here (pre-existing, affects local
+mode equally).
 
 ## Done
 

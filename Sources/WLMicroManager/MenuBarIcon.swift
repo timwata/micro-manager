@@ -14,6 +14,7 @@ enum MenuBarIcon {
         case off
         case permissionDenied
         case deviceMissing
+        case linkDown        // running on a remote whose tunnel is not up
         case idle            // running, no agents
         case allIdle
         case working
@@ -26,6 +27,9 @@ enum MenuBarIcon {
             guard bridge.isRunning else { return .off }
             if bridge.permissionDenied { return .permissionDenied }
             if !bridge.deviceConnected { return .deviceMissing }
+            // An empty pad is not "no agents" while the tunnel is down: the
+            // pad is not mirroring anything, which must not look like calm.
+            if bridge.isRemote, bridge.link != .connected { return .linkDown }
             guard let state = bridge.aggregateState else { return .idle }
             switch state {
             case "blocked": return .blocked
@@ -37,7 +41,7 @@ enum MenuBarIcon {
         var symbolName: String {
             switch self {
             case .off: return "keyboard"
-            case .permissionDenied, .deviceMissing: return "keyboard.badge.exclamationmark"
+            case .permissionDenied, .deviceMissing, .linkDown: return "keyboard.badge.exclamationmark"
             case .idle: return "keyboard"
             case .allIdle, .working, .blocked: return "keyboard.fill"
             }
@@ -48,7 +52,7 @@ enum MenuBarIcon {
             switch self {
             case .off, .idle: return nil
             case .permissionDenied: return .systemRed
-            case .deviceMissing: return .systemGray
+            case .deviceMissing, .linkDown: return .systemGray
             case .allIdle: return NSColor(srgbRed: 0, green: 0.78, blue: 0.33, alpha: 1)
             case .working: return NSColor(srgbRed: 1, green: 0.63, blue: 0, alpha: 1)
             case .blocked: return NSColor(srgbRed: 1, green: 0.18, blue: 0.18, alpha: 1)
@@ -60,6 +64,7 @@ enum MenuBarIcon {
             case .off: return "Micro Manager is off"
             case .permissionDenied: return "Input Monitoring permission is needed"
             case .deviceMissing: return "Pad not found"
+            case .linkDown: return "Not connected to the remote Herdr"
             case .idle: return "Running — no agents"
             case .allIdle: return "All agents idle"
             case .working: return "An agent is working"
@@ -68,10 +73,18 @@ enum MenuBarIcon {
         }
     }
 
-    static func image(for state: State) -> NSImage {
+    /// The description for a running bridge says which Herdr it is about
+    /// when that is not this Mac, since every state reads the same either way.
+    @MainActor
+    static func help(for state: State, _ bridge: BridgeController) -> String {
+        guard state != .off, let name = bridge.target.remoteName else { return state.help }
+        return "\(state.help) (via \(name))"
+    }
+
+    static func image(for state: State, help: String? = nil) -> NSImage {
         let symbolSize = NSSize(width: 18, height: 18)
         let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
-        let symbol = NSImage(systemSymbolName: state.symbolName, accessibilityDescription: state.help)?
+        let symbol = NSImage(systemSymbolName: state.symbolName, accessibilityDescription: help ?? state.help)?
             .withSymbolConfiguration(config)
             ?? NSImage(size: symbolSize)
 

@@ -114,4 +114,40 @@ final class HerdrRemotesTests: XCTestCase {
     func testRemoteIsIdentifiedByName() {
         XCTAssertEqual(HerdrRemote(name: "gpu", host: "me@gpu-box").id, "gpu")
     }
+
+    // MARK: - Resolving the persisted selection
+
+    private let configured = [
+        HerdrRemote(name: "workbox", host: "workbox"),
+        HerdrRemote(name: "gpu", host: "me@gpu-box"),
+    ]
+
+    func testNoSelectionIsThisMac() {
+        XCTAssertEqual(HerdrRemotes.target(named: nil, in: configured), .local)
+    }
+
+    func testSelectionResolvesToTheConfiguredEntry() {
+        XCTAssertEqual(HerdrRemotes.target(named: "gpu", in: configured), .remote(configured[1]))
+    }
+
+    /// Only the name is persisted, so an edit to the entry is picked up.
+    func testSelectionFollowsAnEditedEntry() {
+        let edited = [HerdrRemote(name: "gpu", host: "me@new-gpu-box", socket: "/tmp/h.sock")]
+        XCTAssertEqual(HerdrRemotes.target(named: "gpu", in: edited), .remote(edited[0]))
+    }
+
+    /// A remote removed from the config, or no config at all, is this Mac
+    /// rather than a host nobody configured any more.
+    func testUnknownSelectionFallsBackToThisMac() {
+        XCTAssertEqual(HerdrRemotes.target(named: "gone", in: configured), .local)
+        XCTAssertEqual(HerdrRemotes.target(named: "gpu", in: []), .local)
+    }
+
+    func testTargetNameRoundTrips() {
+        XCTAssertNil(HerdrTarget.local.remoteName)
+        XCTAssertEqual(HerdrTarget.remote(configured[0]).remoteName, "workbox")
+        for target in [HerdrTarget.local, .remote(configured[0]), .remote(configured[1])] {
+            XCTAssertEqual(HerdrRemotes.target(named: target.remoteName, in: configured), target)
+        }
+    }
 }

@@ -82,6 +82,10 @@ public final class BridgeController: ObservableObject {
     /// the press — this is how a pending land confirmation turns every other
     /// key into "cancel" without those keys also doing their usual work.
     public var onKeyIntercept: ((Int) -> Bool)?
+    /// Called whenever `target` changes, before the new target is brought
+    /// up. The app closes its Stack and Land windows here: what they show,
+    /// and a pending land confirmation, belong to the target the pad left.
+    public var onTargetChange: ((HerdrTarget) -> Void)?
 
     // MARK: - Internals
 
@@ -202,6 +206,7 @@ public final class BridgeController: ObservableObject {
     public func setTarget(_ target: HerdrTarget) async {
         guard target != self.target else { return }
         self.target = target
+        onTargetChange?(target)
         guard isRunning else { return }
 
         teardownHerdr()
@@ -216,6 +221,19 @@ public final class BridgeController: ObservableObject {
         // whichever did owns the Herdr side now.
         guard isRunning, generation == herdrGeneration else { return }
         await startHerdr()
+    }
+
+    /// Retries a failed remote link now. A transient failure would retry by
+    /// itself, but only after its backoff; a permanent one (a rejected key,
+    /// an unknown host key) never does, and re-selecting the same target is
+    /// a no-op. So once the user has fixed what the message named, this is
+    /// the way back short of switching off and on.
+    public func reconnect() {
+        guard isRunning, herdrActive, case .failed = link, let tunnel else { return }
+        // `stop()` reports `.idle`, which `tunnelChanged` ignores; `start()`
+        // then moves the link to `.connecting` as any first attempt would.
+        tunnel.stop()
+        tunnel.start()
     }
 
     /// Kills a remote target's ssh, synchronously. Meant for
@@ -641,8 +659,11 @@ public final class BridgeController: ObservableObject {
     public func handleKeyPress(_ index: Int) {
         if onKeyIntercept?(index) == true { return }
         // Dark on a remote target (see `padThreads`); say why rather than
-        // letting the press vanish.
-        if isRemote, index == Pad.stackKeyID || index == Pad.landKeyID {
+        // letting the press vanish. A land window that outlived a switch to a
+        // remote (one still running when the target changed) still owns the
+        // land key: its report says to press it again to dismiss.
+        let landKeyOwnedByPanel = index == Pad.landKeyID && landPanelOpen
+        if isRemote, index == Pad.stackKeyID || index == Pad.landKeyID, !landKeyOwnedByPanel {
             noteError("Stack and Land are not available for a remote Herdr.")
             return
         }

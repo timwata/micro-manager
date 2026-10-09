@@ -82,7 +82,9 @@ login shell is asked. Set `WL_BUT_PATH` to skip all of it.
 
 Click the menu-bar icon. It draws the pad in its real shape with every key
 showing its live colour, then one row per agent. Click a key or a row to jump to
-that agent. It also carries the on/off switch, an "Open at login" toggle, a
+that agent. It also carries the on/off switch, the choice of which Herdr to
+mirror ([this Mac or another machine](#a-herdr-on-another-machine)), an "Open
+at login" toggle, a
 warning when another app is fighting for the device, and the **Inspector**
 button.
 
@@ -165,11 +167,51 @@ text replaces its right-command tap.
 order — the joystick steers that menu rather than owning it, so there is nothing
 to read it from.
 
+**Edit Config…** in the panel opens the file, creating an empty one first if
+there is none.
+
+### A Herdr on another machine
+
+The pad can mirror a Herdr running somewhere else, reached over SSH. List the
+hosts under `remotes`:
+
+```json
+{
+  "remotes": [
+    { "name": "workbox", "host": "workbox" },
+    { "name": "gpu", "host": "me@gpu-box", "socket": "/run/user/1000/herdr.sock" }
+  ]
+}
+```
+
+and pick one from the **Herdr** menu at the top of the panel; **This Mac** goes
+back. The choice survives a relaunch. One server at a time — the pad never
+mixes agents from two.
+
+- `name` is the label in the menu; `host` is anything `ssh` accepts as a
+  destination, so aliases, `ProxyJump` and identities from `~/.ssh/config` all
+  apply. `socket` is the Herdr socket on that machine, default
+  `~/.config/herdr/herdr.sock` (`~` is the remote home).
+- The app runs the system `ssh` in **batch mode**: there is no terminal to type
+  a password or accept a host key into. Log in with a key or an agent, and run
+  `ssh <host>` once in a terminal first to trust the host key. A rejected key or
+  an unknown host key is shown in the panel and not retried — fix it and press
+  **Retry**. Network trouble is retried by itself.
+- The tunnel is a dedicated ssh process (`ControlMaster` is turned off for it),
+  tied to the app: quitting stops it, and even a crash ends it on its own.
+- **Stack** and **Land** are off for a remote Herdr — they run `but` on this
+  Mac, and the agent's directory is on the other one. Everything else works,
+  and agent keys raise the local terminal you run the ssh session in.
+- The icon turns grey while the link is down, so an empty pad never passes
+  for "no agents".
+
+Config edits show up the next time the panel opens.
+
 | variable | what it overrides |
 |---|---|
 | `WL_TERMINAL_BUNDLE_ID` | the terminal to raise (default Ghostty) |
 | `WL_BUT_PATH` | the GitButler binary, skipping the search |
-| `HERDR_SOCKET_PATH` | the Herdr socket |
+| `HERDR_SOCKET_PATH` | the Herdr socket — wins over the **Herdr** menu, which is then disabled |
 | `WL_SIGN_IDENTITY` | the signing identity `bundle.sh` uses |
 
 ## Why it must be bundled and signed
