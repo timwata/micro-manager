@@ -124,6 +124,12 @@ public final class BridgeController: ObservableObject {
     /// a superseded tunnel's state change, a closed stream's retry, an
     /// `agent.list` that was in flight across a switch — and are dropped.
     private var herdrGeneration = 0
+    /// Refreshes overlap — the poll, debounced events and tunnel changes each
+    /// start one — and over a tunnel they can finish out of order. Each takes
+    /// a number when it starts; one that finishes after a later-numbered one
+    /// has painted is stale and is dropped.
+    private var refreshIssued = 0
+    private var refreshApplied = 0
 
     public init(config: BridgeConfig = BridgeConfig()) {
         self.config = config
@@ -475,7 +481,7 @@ public final class BridgeController: ObservableObject {
                 let cfg = try await KeymapManager.read(device)
                 keymapReady = KeymapManager.isAgentKeymapApplied(cfg)
                 if !keymapReady {
-                    lastError = "The agent keys and the stack key are not bound to KV_OAI_AG00..AG06, so per-key colours will do nothing."
+                    lastError = "Not every key, the dial and the joystick are bound to their KV_OAI_AG* codes, so some keys will stay dark and some presses will do nothing. Turn on keymap management or rebind them."
                 }
             }
         } catch {
@@ -487,9 +493,16 @@ public final class BridgeController: ObservableObject {
     private func scheduleReopen() {
         guard isRunning, reopenTask == nil else { return }
         reopenTask = Task { [weak self] in
+            // Once cancelled, the slot belongs to `stop()`, and maybe already
+            // to the task a later `start()` scheduled; only a task that ran
+            // its course clears it.
+            defer { if !Task.isCancelled { self?.reopenTask = nil } }
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
-                guard let self, self.isRunning else { return }
+                // The sleep returns early when cancelled. A stop and a start
+                // since then would leave isRunning true, and this task must
+                // not open the device behind the new run's back.
+                guard !Task.isCancelled, let self, self.isRunning else { return }
                 if self.deviceConnected { break }
                 await self.openDevice()
                 if self.deviceConnected {
@@ -497,7 +510,6 @@ public final class BridgeController: ObservableObject {
                     break
                 }
             }
-            self?.reopenTask = nil
         }
     }
 
@@ -579,9 +591,12 @@ public final class BridgeController: ObservableObject {
     private func refresh() async {
         guard isRunning, herdrActive else { return }
         let generation = herdrGeneration
+        refreshIssued += 1
+        let seq = refreshIssued
 
         var fetched: [HerdrAgent] = []
-        if linkUp {
+        let read = linkUp
+        if read {
             do {
                 fetched = try await listAgents()
             } catch {
@@ -592,8 +607,12 @@ public final class BridgeController: ObservableObject {
                 return
             }
             guard isRunning, generation == herdrGeneration else { return }
-            lastError = nil
         }
+        // A later refresh has painted already — possibly the empty pad of a
+        // link that dropped while this read was in flight.
+        guard seq > refreshApplied else { return }
+        refreshApplied = seq
+        if read { lastError = nil }
         agents = fetched
         reconcileStatusStreams(fetched)
         await render(fetched)

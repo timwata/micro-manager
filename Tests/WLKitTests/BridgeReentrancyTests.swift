@@ -66,6 +66,39 @@ final class BridgeReentrancyTests: XCTestCase {
         XCTAssertTrue(bridge.agents.isEmpty, "the old target's late reply is dropped")
     }
 
+    // MARK: - Overlapping refreshes
+
+    /// Refreshes overlap, and over a tunnel they can finish out of order. The
+    /// one that started last describes the newer state, so a slower, older
+    /// read that finishes after it must not paint over it.
+    func testOlderRefreshFinishingLastIsDropped() async throws {
+        let older = HerdrAgent(status: "working", paneID: "reentrancy:older")
+        let newer = HerdrAgent(status: "blocked", paneID: "reentrancy:newer")
+        // No poll may slip a read of its own in between the two.
+        var config = BridgeConfig()
+        config.pollInterval = 3600
+        bridge = BridgeController(config: config)
+        bridge.sshPath = "/usr/bin/false"
+        await bridge.useEmulator(true)
+        bridge.listAgents = { [] }
+        await bridge.start()
+
+        let gate = Gate()
+        bridge.listAgents = { try await gate.hold() }
+        let first = Task { await bridge.forceRepaint() }
+        try await waitUntil("first agent.list in flight") { gate.heldCount == 1 }
+        let second = Task { await bridge.forceRepaint() }
+        try await waitUntil("second agent.list in flight") { gate.heldCount == 2 }
+
+        gate.release(call: 1, with: [newer])
+        await second.value
+        XCTAssertEqual(bridge.agents, [newer])
+        gate.release(call: 0, with: [older])
+        await first.value
+
+        XCTAssertEqual(bridge.agents, [newer])
+    }
+
     // MARK: - A switch while start() opens the device
 
     /// A switch while `start()` is still opening the pad must not paint
@@ -211,18 +244,29 @@ final class BridgeReentrancyTests: XCTestCase {
 
     // MARK: - Helpers
 
-    /// Holds every `agent.list` open until the test releases them all.
+    /// Holds every `agent.list` open until the test releases it. Calls are
+    /// numbered from 0 in the order they arrive, so each can be released on
+    /// its own, or all at once.
     @MainActor
     private final class Gate {
-        private var waiting: [CheckedContinuation<[HerdrAgent], Error>] = []
+        private var waiting: [Int: CheckedContinuation<[HerdrAgent], Error>] = [:]
+        private var calls = 0
         var isHolding: Bool { !waiting.isEmpty }
+        var heldCount: Int { waiting.count }
 
         func hold() async throws -> [HerdrAgent] {
-            try await withCheckedThrowingContinuation { waiting.append($0) }
+            try await withCheckedThrowingContinuation { continuation in
+                waiting[calls] = continuation
+                calls += 1
+            }
+        }
+
+        func release(call: Int, with agents: [HerdrAgent]) {
+            waiting.removeValue(forKey: call)?.resume(returning: agents)
         }
 
         func release(_ agents: [HerdrAgent]) {
-            waiting.forEach { $0.resume(returning: agents) }
+            waiting.values.forEach { $0.resume(returning: agents) }
             waiting.removeAll()
         }
     }

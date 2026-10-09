@@ -82,7 +82,8 @@ public final class WLDevice {
         }
     }
 
-    // Callbacks, always delivered on the main queue.
+    // Callbacks, always delivered on the main queue. The device itself is
+    // confined to the main queue too (see the `Sendable` conformance below).
     public var onTX: ((String, Any?, Int) -> Void)?          // method, params, id
     public var onResponse: ((Int, Any?, String?) -> Void)?   // id, result, errorMessage
     public var onNotification: ((String, Any?) -> Void)?     // method, params
@@ -114,7 +115,13 @@ public final class WLDevice {
 
     public init(emulator: PadEmulator? = nil) { self.emulator = emulator }
 
-    deinit { inputBuffer.deallocate() }
+    /// The input and removal callbacks hold `self` unretained, so a device
+    /// released while still open would leave IOKit calling into freed memory —
+    /// and writing reports into the freed buffer. Disconnect first, then free.
+    deinit {
+        disconnect(reason: nil)
+        inputBuffer.deallocate()
+    }
 
     // MARK: - Connect
 
@@ -437,3 +444,9 @@ public final class WLDevice {
         return pairs.contains { ($0[kIOHIDDeviceUsagePageKey] as? Int) == WLDevice.vendorUsagePage }
     }
 }
+
+/// `WLDevice` is confined to the main queue rather than locked: IOKit
+/// delivers input reports and removal on the main run loop, every callback
+/// above is dispatched there, and `callAsync` hops there before touching any
+/// state. Sending a reference to another queue is fine; using it there is not.
+extension WLDevice: @unchecked Sendable {}

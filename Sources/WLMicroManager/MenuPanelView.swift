@@ -9,6 +9,7 @@ struct MenuPanelView: View {
     @State private var inspectorError: String?
     @State private var configError: String?
     @State private var remotes: [HerdrRemote] = HerdrRemotes.load()
+    @State private var panel = PanelWindow()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -54,9 +55,13 @@ struct MenuPanelView: View {
         .frame(width: 300)
         // Re-read on every opening, so a config edit shows up without a
         // relaunch. The window may be kept alive between openings, in which
-        // case only becoming key marks a new one.
+        // case only becoming key marks a new one — this panel's window, not
+        // the emulator or any other window of the app, which would re-read
+        // the config (and maybe restart a tunnel) for no reason.
         .onAppear { reloadRemotes() }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+        .background(WindowReader { panel.window = $0 })
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            guard let window = note.object as? NSWindow, window === panel.window else { return }
             reloadRemotes()
         }
     }
@@ -77,7 +82,9 @@ struct MenuPanelView: View {
                 get: { bridge.isRunning },
                 set: { on in
                     BridgeSettings.enabled = on
-                    Task { await bridge.toggle() }
+                    // Set, not toggle: a stale displayed state must not turn
+                    // a click into the opposite of what the switch shows.
+                    Task { if on { await bridge.start() } else { await bridge.stop() } }
                 }
             ))
             .toggleStyle(.switch)
@@ -438,6 +445,36 @@ struct MenuPanelView: View {
             NSWorkspace.shared.open([url], withApplicationAt: textEdit, configuration: NSWorkspace.OpenConfiguration())
         } else {
             configError = "No app to open \(path) with."
+        }
+    }
+}
+
+/// The panel's window, held weakly. A class rather than view state, so
+/// recording it never triggers a view update.
+private final class PanelWindow {
+    weak var window: NSWindow?
+}
+
+/// Reports the window its view is placed in, and again whenever that changes.
+private struct WindowReader: NSViewRepresentable {
+    let onWindow: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> NSView { ReportingView(onWindow: onWindow) }
+    func updateNSView(_ view: NSView, context: Context) {}
+
+    private final class ReportingView: NSView {
+        let onWindow: (NSWindow?) -> Void
+
+        init(onWindow: @escaping (NSWindow?) -> Void) {
+            self.onWindow = onWindow
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            onWindow(window)
         }
     }
 }
