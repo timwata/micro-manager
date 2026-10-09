@@ -1,0 +1,338 @@
+# Pad contention: a warning that can clear
+
+Status: planned.
+
+The panel warns "Another app is also driving this pad — colours may fight."
+when something else talks to the pad. Once raised, the warning stays until
+the bridge is switched off and on again, even after the other app has quit.
+This plan makes it clear in two steps:
+
+- **Phase 1 (option A):** a manual **Recheck** button, and the warning
+  cleared when the bridge stops. Small, and needs no hardware to build.
+- **Phases 2–3 (option C):** an active check that asks the IORegistry which
+  other processes hold the pad open. It runs whenever the panel opens, so to
+  the user the warning updates by itself, and it names the other app.
+
+Option B (expire the warning N seconds after the last foreign reply) was
+considered and rejected: detection by traffic is passive, so an idle client
+is invisible either way, and a client that only talks now and then would
+make the warning come and go.
+
+Line numbers are as of `b303213` and will drift. Find code by the symbol
+named, not by the line.
+
+---
+
+## Rules for the implementing agent
+
+The same rules as `design/followup-fixes.md` § "Rules for the implementing
+agent" apply: one phase = one branch = one PR based on `main`, tick the boxes
+in this file in the same PR, Notes per phase, a "Found during
+implementation" list for anything out of scope, mutation-check new tests,
+never claim a hardware or UI check you did not do, English throughout, read
+`docs/hacking.md` before touching `WLDevice`. The recommended order across
+both plans is in that file.
+
+Phase 2 has a **gate**: its hardware findings decide whether Phase 3 is built
+as designed here, adjusted, or dropped. Do not start Phase 3 until Phase 2's
+Notes record those findings.
+
+---
+
+## Part 1 — Background and design
+
+### How detection works today
+
+- `WLDevice` opens the pad **shared**: a seizing open fails with
+  `0xE00002C1`, because macOS will not let anything seize a device that
+  carries a keyboard collection (see the `WLDevice` doc comment and
+  `docs/hacking.md`). So every client receives every other client's replies.
+- `BridgeController.wire(_:)` records every id it sends (`device.onTX` →
+  `issuedIDs`) and, on each reply (`device.onResponse`), sets
+  `contendingClient = true` when the id is not one it issued.
+- `contendingClient` is reset only in `start()`. `stop()` leaves it set, and
+  the panel (`MenuPanelView`, the `if bridge.contendingClient` block) shows
+  it whether or not the bridge is running.
+- Detection is passive. A client that has the pad open but sends nothing is
+  never seen, and clearing the flag proves nothing until the other client
+  next sends a request.
+
+A common way to trip it is the panel's own **Inspector** button: the
+Inspector is a separate process that opens the same pad. Close it, and the
+warning stays.
+
+### What the IORegistry shows
+
+Observed on 2026-10-10 with a Creator Micro 2 on USB, the installed app
+running, and `ioreg -r -n "Creator Micro 2" -l -w0`:
+
+- Each USB interface of the pad is its own `IOHIDDevice` service
+  (`AppleUserUSBHostHIDDevice`). A process that opens one gets an
+  `IOHIDLibUserClient` child under it, whose `IOUserClientCreator` property
+  reads `"pid <n>, <process name>"`.
+- On the vendor interface (`PrimaryUsagePage` = 65280 = `0xFF00`, the one
+  `WLDevice` talks to), the only client was MicroManager.
+- On the keyboard interface, Discord and Discord Helper held clients. They
+  never talk to the pad's vendor protocol, so counting every client of every
+  interface would be wrong.
+- MicroManager also held a client on the consumer-control interface:
+  `IOHIDManagerOpen` opens every interface that matches its vendor-only
+  filter, not just the one `WLDevice` picks.
+- Process names in `IOUserClientCreator` can be cut short
+  (`"Discord Helper ("`), so they make a poor label.
+
+So for a pad on USB, "other processes with a client on the vendor interface"
+is an exact, active answer to "who else can drive the lighting". On
+Bluetooth the pad is a single `IOHIDDevice` that carries the keyboard too
+(see `WLDevice.connect()`), so the same list may include keyboard listeners
+such as Discord. Phase 2 checks this.
+
+### Option A — manual recheck (Phase 1)
+
+- `BridgeController.recheckContention() async`: sets
+  `contendingClient = false`, then, if running, `await forceRepaint()`. The
+  repaint puts our colours back over whatever the other app painted, which
+  is what the user wants after quitting it.
+- **Never clear `issuedIDs`** in a recheck. A reply to one of our own calls
+  still in flight would then look foreign and raise the warning again at
+  once.
+- `stop()` clears `contendingClient`: an off bridge drives nothing, so there
+  is nothing to fight over. `start()` already clears it.
+- Testing seam: move the body of the `device.onResponse` closure in
+  `wire(_:)` into an internal `func noteResponse(id: Int)`, so a test can
+  inject a reply id the bridge never issued. The closure calls it; behaviour
+  is unchanged.
+- Panel: the warning row gets a small **Recheck** button, laid out like the
+  link status's **Retry** (`HStack(alignment: .firstTextBaseline)`, text,
+  `Spacer`, `.controlSize(.small)`), with the help text "Clear the warning.
+  It comes back if the other app sends to the pad again." The warning text
+  stays as it is.
+
+### Option C — active check (Phases 2–3)
+
+#### WLKit: scanning the registry (Phase 2)
+
+```swift
+/// A process other than this one that holds the pad open.
+public struct HIDClient: Equatable, Sendable {
+    public let pid: pid_t
+    /// From `NSRunningApplication`, else the registry's (possibly cut) name.
+    public let name: String
+}
+
+public enum HIDClientScan: Equatable, Sendable {
+    /// Nothing to scan: the emulator, no open device, or a registry error.
+    case unavailable
+    /// The opened device is a dedicated vendor interface (its primary usage
+    /// page is 0xFF00): every other client there can drive the lighting.
+    case authoritative([HIDClient])
+    /// The opened device also carries the keyboard (Bluetooth): other
+    /// clients may only be listening for keys.
+    case advisory([HIDClient])
+}
+
+extension WLDevice {
+    public func otherClients() -> HIDClientScan
+}
+```
+
+- Walk: `IOHIDDeviceGetService(device)` →
+  `IORegistryEntryGetChildIterator(service, kIOServicePlane)` → children for
+  which `IOObjectConformsTo(child, "IOHIDLibUserClient")` → read
+  `IORegistryEntryCreateCFProperty(child, "IOUserClientCreator" as CFString, …)`.
+  Release every `io_object_t`.
+- Only the service of the `IOHIDDevice` that `WLDevice` opened is scanned,
+  not its siblings: that is what keeps the keyboard interface's listeners
+  out on USB.
+- Parsing is a pure, internal `static func parseCreator(_ value: String) ->
+  (pid: pid_t, name: String)?` for `"pid <n>, <name>"`. It returns nil for
+  anything else.
+- Drop entries whose pid is `getpid()` (this process may hold several), and
+  de-duplicate by pid (one process may hold several clients).
+- Label: `NSRunningApplication(processIdentifier:)?.localizedName`, falling
+  back to the parsed name. The Inspector is then "Inspector" (or whatever its
+  bundle calls itself).
+- Authoritative vs advisory: `.authoritative` when the opened device's
+  `PrimaryUsagePage` is `WLDevice.vendorUsagePage`, `.advisory` otherwise.
+  Phase 2's hardware checks confirm or change this rule.
+- The scan reads a handful of registry entries and is synchronous. Calling
+  it on the main actor is fine; measure it once (Notes).
+
+`IOUserClientCreator` is not documented API. It has been stable for many
+macOS releases and `ioreg` shows it, but every failure (property missing,
+unexpected format) must degrade to `.unavailable` or to a client list
+without that entry, never to a crash or a false warning.
+
+#### Bridge and panel (Phase 3)
+
+State, in `BridgeController`:
+
+- `trafficSeen: Bool` (private): today's flag, renamed. Set by
+  `noteResponse(id:)` for a foreign id, cleared by `start()`, `stop()` and a
+  recheck.
+- `@Published public private(set) var contenders: [HIDClient]`: the last
+  scan's list, for the label.
+- `@Published public private(set) var contendingClient: Bool` stays the one
+  flag the panel shows. It is recomputed in one private `updateContention()`
+  from `trafficSeen` and the last scan:
+
+| last scan | others | `contendingClient` | effect on `trafficSeen` |
+|---|---|---|---|
+| `.unavailable` | — | `trafficSeen` | none (Phase 1 behaviour) |
+| `.authoritative` | empty | false | cleared: whoever sent it is gone |
+| `.authoritative` | some | true | none |
+| `.advisory` | empty | false | cleared |
+| `.advisory` | some | `trafficSeen` | none: the list labels, it cannot raise |
+
+Scans run:
+
+- when the panel opens: the existing `.onAppear` and own-window
+  `didBecomeKeyNotification` hooks in `MenuPanelView`, which already call
+  `reloadRemotes()`, also call a new `bridge.scanContention()` (scan only,
+  no repaint);
+- from **Recheck**: `recheckContention()` clears `trafficSeen`, scans, then
+  repaints as in Phase 1;
+- after a foreign reply, to put a name on it: at most one scan per second,
+  so a chatty client cannot turn every reply into a registry walk;
+- after the device (re)opens in `openDevice()`.
+
+There is no timer: the warning is only visible in the panel, and the panel
+scans whenever it opens. The menu-bar icon does not show contention, and this
+plan does not change that.
+
+Testing seam: `var scanClients: @MainActor () -> HIDClientScan`, defaulting
+to a closure that scans the bridge's current device (read the device at call
+time; `useEmulator` replaces it), like `listAgents`.
+
+Panel copy:
+
+- authoritative, or advisory with traffic seen and names known: "Also driving
+  this pad: Input, Inspector — colours may fight."
+- names unknown: today's text.
+- **Recheck** stays in every case.
+
+---
+
+## Part 2 — Phased ToDo
+
+### Phase 1 — Manual recheck (option A)
+
+Branch `feat/contention-1-recheck` · PR title `feat: recheck the "another app" warning`
+
+- [ ] `BridgeController.noteResponse(id:)` (internal) holds the reply-id
+      check; the `onResponse` closure in `wire(_:)` calls it.
+- [ ] `BridgeController.recheckContention()` clears `contendingClient` and,
+      when running, `forceRepaint()`s. `issuedIDs` is left alone, with a
+      comment saying why.
+- [ ] `stop()` clears `contendingClient`.
+- [ ] Panel: **Recheck** button in the warning row, laid out like **Retry**,
+      with the help text from Part 1.
+- [ ] Tests (`BridgeContentionTests`, on the emulator):
+  - [ ] a foreign id sets the flag; replies to the bridge's own calls never
+        do (start, repaint, check);
+  - [ ] `recheckContention()` clears it, and a foreign id afterwards sets it
+        again;
+  - [ ] `stop()` clears it;
+  - [ ] a recheck while a repaint is in flight does not re-raise it (gate
+        the repaint's device call or start the recheck before the emulator's
+        reply hop, then let it finish and check the flag).
+- [ ] Each test mutation-checked (for example: clear `issuedIDs` in the
+      recheck and watch the last test fail).
+- [ ] `README.md` "Only one bridge at a time": the warning stays until the
+      other app has quit and **Recheck** is pressed (or the bridge is
+      switched off and on); the Inspector counts as another app.
+- [ ] `CLAUDE.md` "Only one HID client at a time" bullet mentions
+      `recheckContention()` and that `issuedIDs` must survive it.
+- [ ] User checks listed in the PR: open the Inspector from the panel, see
+      the warning, quit the Inspector, press **Recheck**, warning gone and
+      pad repainted; switch off with the warning up, warning gone.
+- [ ] `swift build -c release` (zero warnings) and
+      `env -u HERDR_SOCKET_PATH swift test` green.
+
+Notes:
+
+### Phase 2 — Registry scan in WLKit (option C, part 1)
+
+Branch `feat/contention-2-registry-scan` · PR title `feat: list the other processes holding the pad open`
+
+- [ ] `HIDClient`, `HIDClientScan` and `WLDevice.otherClients()` as in
+      Part 1; the emulator and a closed device return `.unavailable`.
+- [ ] Pure `parseCreator(_:)`, with tests: a normal value, a cut name
+      (`"pid 24023, Discord Helper ("`), a name with commas, no comma,
+      a non-numeric pid, an empty string.
+- [ ] Own pid dropped and pids de-duplicated, tested through a pure helper
+      that takes parsed entries plus the own pid.
+- [ ] Every `io_object_t` from the iterator released (review it; `leaks` on
+      a loop of 1,000 scans in a live test if a pad is present).
+- [ ] `LiveDeviceClientsTests`: with a pad, `otherClients()` is not
+      `.unavailable` and never lists this test process. It prints the scan.
+      Skips without a pad, like `LiveDeviceTests`.
+- [ ] **verify** (pad on USB): run the live test while the installed
+      MicroManager.app runs. The test process holds the pad as well, so the
+      app must appear in the scan as an `.authoritative` client by name.
+      Record the output.
+- [ ] **verify** (user check if not possible in-session): the Inspector,
+      Work Louder's Input app and the Codex desktop app each appear while
+      open, and disappear once quit.
+- [ ] **verify** (user check if no Bluetooth pad in-session): over
+      Bluetooth the scan is `.advisory`; record which clients appear with no
+      other app driving the pad (keyboard listeners such as Discord).
+- [ ] Scan duration measured (Notes). If it is over ~5 ms, say so: Phase 3
+      runs it on the main actor.
+- [ ] **Gate:** Notes state whether Phase 3 goes ahead as designed. If any
+      verify above fails (a contender does not appear, the property is
+      missing, Bluetooth lists unrelated clients even in `.authoritative`
+      cases), write the adjusted Phase 3 design into this file's Part 1
+      first, or record that C is dropped and Phase 1 is the final state.
+- [ ] `docs/hacking.md` "You are not the only client": add the IORegistry
+      check (`ioreg -r -n "Creator Micro 2" -l -w0`, `IOUserClientCreator`
+      on the vendor interface) as the active way to see who else holds the
+      pad.
+- [ ] `swift build -c release` (zero warnings) and
+      `env -u HERDR_SOCKET_PATH swift test` green.
+
+Notes:
+
+### Phase 3 — Bridge and panel (option C, part 2)
+
+Branch `feat/contention-3-active-check` · PR title `feat: clear the "another app" warning once the other app is gone`
+
+- [ ] Phase 2's gate in Notes says go (or Part 1 was adjusted first).
+- [ ] `trafficSeen`, `contenders`, `updateContention()` and the table in
+      Part 1; `contendingClient` stays the flag the panel reads.
+- [ ] `scanClients` seam; `scanContention()` (scan only) and
+      `recheckContention()` (clear traffic, scan, repaint).
+- [ ] Scans on panel open (both existing hooks), on **Recheck**, after a
+      foreign reply (at most once a second) and after `openDevice()`
+      succeeds.
+- [ ] Panel copy with names, as in Part 1; **Recheck** kept.
+- [ ] Tests (`BridgeContentionTests`, with the `scanClients` seam): every row
+      of the table; the one-per-second limit on reply-triggered scans; a
+      recheck that finds an authoritative empty list clears traffic seen
+      earlier; `.unavailable` behaves exactly as Phase 1.
+- [ ] Each test mutation-checked.
+- [ ] `README.md` "Only one bridge at a time": the panel names the other
+      app, and the warning clears by itself when the panel next opens after
+      that app has quit (USB). Explain the Bluetooth caveat if Phase 2 found
+      one.
+- [ ] `CLAUDE.md`: the "Only one HID client at a time" bullet describes
+      both signals (reply ids, registry scan) and the table's rule.
+- [ ] User checks listed in the PR: Inspector open → named warning; quit it,
+      reopen the panel → warning gone without pressing anything; same with
+      Input or Codex if installed.
+- [ ] `swift build -c release` (zero warnings) and
+      `env -u HERDR_SOCKET_PATH swift test` green.
+
+Notes:
+
+### Done
+
+- [ ] All PRs merged (or Phase 3 dropped at the gate, with the reason in
+      Phase 2's Notes); set this file's status to "implemented (PRs #…)".
+
+---
+
+## Found during implementation
+
+(Problems discovered while working through the phases go here, not into the
+current PR.)

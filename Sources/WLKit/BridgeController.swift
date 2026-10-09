@@ -13,8 +13,9 @@ import IOKit.hid
 ///   3. a slow poll of `agent.list` as a backstop
 ///
 /// `agent.list` is always the source of truth; events only decide *when* to
-/// look. This is a port of `bin/leds.js` — including the parts that were bug
-/// fixes, which are called out where they matter.
+/// look. This started as a port of the earlier Node bridge (`bin/leds.js`,
+/// not part of this repository) — including the parts that were bug fixes,
+/// which are called out where they matter.
 @MainActor
 public final class BridgeController: ObservableObject {
 

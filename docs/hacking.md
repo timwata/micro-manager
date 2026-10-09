@@ -679,30 +679,33 @@ and the Codex desktop app both do.
 variant. If `v.oai.thstatus` returns `Method not found` rather than `{"ok":1}`,
 this firmware genuinely does not have it. Older Creator Micro 2 firmware
 (v0.4.0, v0.6.0-rc.8) registered the methods as no-op stubs — accepted
-everything, lit nothing. `docs/per-key-rgb-investigation.md` is the write-up
-from before it worked, kept because the elimination process is the useful part.
+everything, lit nothing.
 
 ---
 
 ## Where the working code lives
 
+Everything above is implemented in Swift, in this repository:
+
 | | |
 |---|---|
-| `lib/wl-device.js` | the transport, production version |
-| `lib/oai.js` | the vendor lighting API and notification decoding |
-| `lib/keymap.js` | reading, checking and writing the keymap |
-| `bin/probe.js` | which methods this firmware actually registers |
-| `bin/interactive-lab.js` | 12 lighting experiments, prompting after each |
-| `bin/lights-off.js` | the two-call blanking above |
-| `swift/Sources/WLKit/` | the same protocol in Swift/IOKit |
-| `swift/Sources/WLInspector/` | a GUI for watching traffic and driving lights by hand |
+| `Sources/WLKit/WLDevice.swift` | the transport: matching, the shared open, framing and reassembly |
+| `Sources/WLKit/OAIProtocol.swift` | the vendor lighting API (`v.oai.*`), the pad map and key-event decoding |
+| `Sources/WLKit/KeymapManager.swift` | reading, checking and writing the keymap |
+| `Sources/WLKit/BridgeController.swift` | the bridge; `lightsOffCalls` is the two-call blanking above |
+| `Sources/WLKit/PadEmulator.swift` | an in-process stand-in for the firmware, awkward habits included |
+| `Sources/WLInspector/` | a GUI for watching traffic and driving lights by hand |
 
-`WLInspector` is the fastest way to try a payload shape: it has a raw JSON-RPC
-panel with presets, and logs every message in both directions with the
-notifications decoded.
+The Node snippets in this guide are self-contained: save them as shown and
+they run without anything else from this repository.
+
+`WLInspector` is the fastest way to try a payload shape, or to find out which
+methods your firmware actually registers: it has a raw JSON-RPC panel with
+presets, and logs every message in both directions with the notifications
+decoded.
 
 ```bash
-cd swift && swift run WLInspector
+swift run WLInspector
 ```
 
 Run it from a terminal that already has Input Monitoring — macOS attributes the

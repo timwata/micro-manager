@@ -182,6 +182,7 @@ A few environment variables override the defaults:
 | `WL_BUT_PATH` | the GitButler binary, skipping the search |
 | `HERDR_SOCKET_PATH` | the Herdr socket — wins over the **Herdr** menu, which is then disabled |
 | `WL_SIGN_IDENTITY` | the signing identity `bundle.sh` uses |
+| `WL_EMULATE` | `1` drives the virtual pad for that run, whatever the panel says |
 
 ## A Herdr on another machine
 
@@ -285,7 +286,12 @@ downloading.
 Work Louder's Input app and the Codex desktop app drive this same pad. Running
 two at once means they overwrite each other. The panel detects this — the device
 is opened shared, so we receive other clients' replies, and a response id we
-never issued is a reliable tell.
+never issued is a reliable tell. The **Inspector** counts too: it is a separate
+process with its own connection to the pad.
+
+Once raised, the warning stays until the manager is switched off and on again,
+even after the other app has quit. A way to clear it without that is planned in
+[design/pad-contention.md](design/pad-contention.md).
 
 ## Development
 
@@ -293,7 +299,7 @@ never issued is a reliable tell.
 swift build            # both apps and the shared library
 swift test             # live tests skip themselves without hardware
 swift run WLInspector  # the debug UI
-./scripts/bundle.sh    # assemble build/MicroManager.app, unsigned install
+./scripts/bundle.sh    # assemble and sign build/MicroManager.app (--install to install it)
 ```
 
 | | |
@@ -302,7 +308,7 @@ swift run WLInspector  # the debug UI
 | `Sources/WLMicroManager` | the menu-bar app and its panels |
 | `Sources/WLInspector` | the debug UI |
 | `docs/hacking.md` | how the pad protocol works, and how to drive it yourself |
-| `design/` | design notes and task logs for larger features (remote Herdr) |
+| `design/` | design notes, fix plans and task logs for larger changes |
 | `docs/index.html` | the website, served by GitHub Pages from `docs/` |
 
 The device protocol — raw-HID JSON-RPC, per-key colour, key and joystick events,
