@@ -1,6 +1,6 @@
 # Fix plan: code review of `main` (2026-10-09)
 
-Status: planned, nothing implemented yet.
+Status: in progress. Phase 1 implemented.
 
 Source: a whole-repo review of `main` at `c72fefe`. Build and tests were green
 at that commit (169 tests, 0 failures, 11 skipped). Each finding below has an
@@ -456,19 +456,42 @@ warnings.
 
 Branch `fix/review-1-launch` · PR title `fix: start the bridge at launch, not on first panel open`
 
-- [ ] `AppDelegate` is `@MainActor` and owns `let bridge = BridgeController()`.
-- [ ] Wiring moved from the `.task` into `AppDelegate`, called from
+- [x] `AppDelegate` is `@MainActor` and owns `let bridge = BridgeController()`.
+- [x] Wiring moved from the `.task` into `AppDelegate`, called from
       `applicationDidFinishLaunching`, followed by the bootstrap `Task`
       (emulator, then target, then start-if-enabled, in that order).
-- [ ] `MicroManagerApp`: no `@StateObject`; `.environmentObject(delegate.bridge)`;
+- [x] `MicroManagerApp`: no `@StateObject`; `.environmentObject(delegate.bridge)`;
       label extracted to `MenuBarLabel` with `@ObservedObject`; `.task` removed.
-- [ ] No `[weak bridge]` captures left; zero `ImplicitStrongCapture` warnings.
-- [ ] Headless check from H1 done; before/after socket counts recorded in
+- [x] No `[weak bridge]` captures left; zero `ImplicitStrongCapture` warnings.
+- [x] Headless check from H1 done; before/after socket counts recorded in
       Notes.
-- [ ] PR lists the user checks from H1.
-- [ ] Remove the "Manual check so far" paragraph at the end of
+- [x] PR lists the user checks from H1.
+- [x] Remove the "Manual check so far" paragraph at the end of
       `design/remote-herdr-todo.md` Phase 4, or point it at this phase.
-- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+- [x] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+Notes:
+
+- Headless check with a local Herdr running, `WL_EMULATE=1`, 6 s after
+  launch, counting `lsof -p $PID -a -U` rows without the header: **0** Unix
+  sockets before the fix, **4** after (the lifecycle stream plus the
+  per-pane status streams). The `WLMicroManager` defaults domain was empty,
+  so this ran with the default target (This Mac) and `bridgeEnabled` unset.
+  Note that the plan's `lsof … | wc -l` counts lsof's header line too.
+- Clean build (`--build-path` in a temp dir): the six `ImplicitStrongCapture`
+  warnings are gone; the only warning left is L10's `SendableClosureCaptures`
+  in `WLDevice+Async.swift`, which Phase 6 handles.
+- The wiring lives in `AppDelegate.wire()`, which takes `let bridge =
+  self.bridge` and captures it strongly. `tune.bindings` no longer needs its
+  `?? KeyBindings()` fallback.
+- `applicationWillTerminate` dropped its `MainActor.assumeIsolated`: the
+  delegate is `@MainActor` now.
+- `MenuBarLabel` is `private` in `MicroManagerApp.swift`, next to the `App`
+  that uses it.
+- Also updated the `.task` bullet in `CLAUDE.md`'s "Things that are easy to
+  get wrong", which described the old behaviour as current. The historical
+  mentions of `.task` in `design/remote-herdr.md` and the Phase 3 log of
+  `design/remote-herdr-todo.md` are left as written.
 
 ### Phase 2 — Land only what was confirmed (H2)
 
