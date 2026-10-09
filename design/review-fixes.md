@@ -1,0 +1,557 @@
+# Fix plan: code review of `main` (2026-10-09)
+
+Status: planned, nothing implemented yet.
+
+Source: a whole-repo review of `main` at `c72fefe`. Build and tests were green
+at that commit (169 tests, 0 failures, 11 skipped). Each finding below has an
+ID (**H** = high, **M** = medium, **L** = low). Part 1 explains the problem and
+the intended fix. Part 2 is the phased checklist the implementing agent works
+through.
+
+Line numbers are as of `c72fefe` and will drift. Find code by the symbol
+named, not by the line.
+
+---
+
+## Rules for the implementing agent
+
+- **One phase = one branch = one PR**, based on `main`. Start a phase only
+  after the previous phase's PR is merged, then branch from the fresh `main`.
+  If you are told to proceed without waiting, stack each branch on the
+  previous one and set the PR base to it.
+- Branch names and PR titles are listed per phase.
+- **Every push to `main` republishes the `latest` release** (`release.yml`).
+  Each PR must therefore leave the app fully working by itself. Do not land
+  half a fix.
+- Before opening each PR:
+  - `swift build -c release` must succeed.
+  - `env -u HERDR_SOCKET_PATH swift test` must be green. Herdr exports
+    `HERDR_SOCKET_PATH` into every pane, and some socket tests skip when it is
+    set.
+  - Tick this phase's boxes **in this file, in the same PR**.
+  - Add a short "Notes" list under the phase for anything that deviates from
+    this plan or was decided along the way.
+- Match the surrounding style. Doc comments explain *why*, as in
+  `BridgeController.swift` and `SSHTunnel.swift`. Read `docs/hacking.md`
+  before touching `WLDevice`. Only Phase 6 (L3) does, and only its `deinit`.
+- **Scope.** Fix what is listed and nothing else. If you find a new problem,
+  add it to "Found during implementation" at the end of this file instead of
+  fixing it in the same PR.
+- **Findings may be wrong.** If one does not reproduce, or the proposed fix
+  turns out to be the wrong shape, do not force it. Record what you found
+  under the phase's Notes, adjust or skip, and say so in the PR description.
+- **What you cannot check.** This environment has no pad and no Accessibility
+  grant, so you cannot click the menu bar or press keys. Never claim a UI
+  check you did not do. List those checks under "User checks" in the PR
+  description. Headless checks (process inspection, `lsof`, tests on the
+  emulator) are fine and expected.
+- Running the debug app writes to the `WLMicroManager` defaults domain. That
+  is separate from the installed app's `cc.worklouder.micromanager`, so it is
+  safe. Always kill any process you launch.
+- Items marked **verify** are assumptions. Record the result in the phase
+  notes.
+
+---
+
+## Part 1 — Findings and intended fixes
+
+### H1. The bridge does not start until the menu panel is first opened
+
+**Where:** `Sources/WLMicroManager/MicroManagerApp.swift`, the `.task` on
+`MenuPanelView` inside `MenuBarExtra`.
+
+**Problem:** All the wiring and the launch bootstrap live in that `.task`:
+
+- stack, land, voice and tune callbacks, the key intercept and
+  `onTargetChange`
+- `delegate.bridge = bridge`
+- `useEmulator`, then `setTarget`, then `start()`
+
+The content of a `MenuBarExtra` is only built when the panel first opens. So
+after launch or login the pad stays dark until the user clicks the icon. The
+"login-item launch resumes" promise in the comment is not kept. This was
+confirmed headless: `WL_EMULATE=1 .build/debug/WLMicroManager` held no Unix
+socket at all after about 9 s, with `bridgeEnabled` unset (which defaults to
+on). The same was already noted at the end of `design/remote-herdr-todo.md`
+Phase 4.
+
+**Fix:**
+
+1. Make `AppDelegate` `@MainActor` and give it ownership of the bridge:
+   `let bridge = BridgeController()`.
+2. Move the wiring into a private method on `AppDelegate`, such as
+   `wire()`, and call it from `applicationDidFinishLaunching`. Then start a
+   `Task` there that runs the bootstrap in the same order as today:
+   `useEmulator(BridgeSettings.emulate)`, then
+   `setTarget(BridgeSettings.resolvedTarget())`, then
+   `start()` if `BridgeSettings.enabled && !bridge.isRunning`.
+3. In `MicroManagerApp`:
+   - drop `@StateObject private var bridge`
+   - inject `delegate.bridge` with `.environmentObject(...)`
+   - move the label into a small `MenuBarLabel: View` with
+     `@ObservedObject var bridge: BridgeController`, so it still re-renders
+     on state changes (the `App` struct cannot observe a delegate's object)
+   - remove the `.task`
+4. Closure captures: the bridge and the panel singletons all live as long as
+   the app. Capture `bridge` strongly through a local `let`, or use
+   `[unowned self]` on the delegate, and drop the `[weak bridge]` captures.
+   This also clears the six `ImplicitStrongCapture` warnings (part of L10).
+   Add one comment explaining why the strong captures are fine.
+5. `applicationWillTerminate` keeps calling `bridge.shutdownTunnel()`. It no
+   longer needs the `weak var bridge`.
+
+Behaviour that must not change:
+
+- The emulator window is still only shown by the panel's toggle, not at
+  launch.
+- `MenuPanelView`'s `.onAppear` / `reloadRemotes()` stays as it is.
+
+**Verify headless:**
+
+```sh
+swift build --product WLMicroManager
+WL_EMULATE=1 .build/debug/WLMicroManager >/dev/null 2>&1 & PID=$!
+sleep 6; lsof -p $PID -a -U | wc -l; kill $PID
+```
+
+This needs a local Herdr running. Before the fix the count is 0. After it,
+the count is at least 1 (the lifecycle stream). If no local Herdr is
+available, say so in the notes and rely on code review.
+
+**User check:** after `./scripts/bundle.sh --install`, the pad lights without
+opening the menu; opening the panel shows the live state; quit leaves no ssh
+running for a remote target.
+
+### H2. Land can push branches the user never confirmed
+
+**Where:** `Sources/WLMicroManager/LandPanel.swift`, `land()`.
+
+**Problem:** The confirmation screen lists `plan`. But `land()` re-reads
+`landPlan` after every land and lands whatever comes first, up to 20 times.
+If an agent creates or applies a branch while the confirmation is up, or
+during the land, that branch is also landed and pushed without consent. This
+breaks the file's own rule that landing is not easily reversible, so nothing
+may be landed that was not agreed to.
+
+**Fix:** Keep re-reading the plan, since each land rebases what is left, but
+only ever land confirmed branches, and stop rather than skip when an
+unconfirmed one is in the way. Skipping could land out of order.
+
+1. Add a pure decision function to `GitButler` in WLKit, so it can be tested:
+
+   ```swift
+   public enum LandStep: Equatable, Sendable {
+       case land(String)
+       case done
+       case stop(String)   // message for the panel
+   }
+   public static func nextLandStep(
+       plan: [String], confirmed: [String], landed: Set<String>
+   ) -> LandStep
+   ```
+
+   It applies these rules in order:
+
+   1. `plan` is empty → `.done`.
+   2. `plan.first` is in `landed` → `.stop("`X` is still in the workspace after landing it; stopping here.")`.
+      This is the existing check, moved here.
+   3. Every confirmed branch is in `landed` → `.done`. New, unconfirmed
+      branches are left alone, silently.
+   4. `plan.first` is not in `confirmed` →
+      `.stop("`X` was not in the confirmed plan; stopping before it. Not landed: a, b.")`,
+      listing the confirmed branches not yet landed.
+   5. Otherwise → `.land(plan.first!)`.
+
+2. In `LandPanelController.land()`, copy `self.plan` into a local
+   `confirmed` **before the first `await`**, because `close()` clears it.
+   Drive the loop with `nextLandStep`. Keep `maxLands` as the outer bound.
+   Append `.stop` messages with `PanelHTML.note`.
+
+**Tests** (`GitButlerLandPlanTests`, or a new `GitButlerLandStepTests`):
+
+- the normal bottom-up sequence
+- a new branch appears at the bottom of a confirmed stack → `.stop`, naming
+  the confirmed branches not yet landed
+- a new branch appears only after every confirmed one has landed → `.done`
+- a branch is still present after landing it → `.stop`
+- an empty plan → `.done`
+
+### M1. Data race in `HerdrClient.request` can double-resume a continuation
+
+**Where:** `Sources/WLKit/HerdrClient.swift`, `request(_:params:timeout:)`.
+
+**Problem:** The `finished` flag is read and written from three places with
+no lock:
+
+- the socket's read queue (`onLine` / `onClosed`)
+- a `DispatchQueue.global()` timeout
+- the caller's thread (an open failure)
+
+If a reply and the timeout coincide, both pass the guard. The continuation
+is then resumed twice, which is a fatal error. `SSHTunnel.probe` already
+does this correctly with an `NSLock`.
+
+**Fix:** Use the `probe` pattern. Take the lock, check `finished` and set it,
+then release the lock. Only after that call `conn.close()` and resume, and
+only for the first caller. The generation check stays.
+
+**Tests:**
+
+- Add a test to `HerdrSocketPathTests` (or a new `HerdrClientRequestTests`)
+  using `FakeHerdrServer`: a request with `timeout: 0.2` gets an immediate
+  reply, then the test waits 0.4 s. It must not crash, and the result must
+  be the reply.
+- **verify** with Thread Sanitizer:
+  `env -u HERDR_SOCKET_PATH swift test --sanitize=thread --filter HerdrSocketPathTests`.
+  Record whether TSan flags `request` before the fix (expected: yes, because
+  the timeout's read has no happens-before edge with the reply's write) and
+  that it is clean after. If TSan cannot run here, note it.
+
+### M2. `SocketConnection` can read from a recycled file descriptor
+
+**Where:** `Sources/WLKit/HerdrClient.swift`, `SocketConnection.close()` and
+`readLoop()`.
+
+**Problem:** `readLoop` copies `fd` under the lock, then calls `read()`
+outside it. `close()` on another thread can close that fd in between. A new
+socket opened in that window can get the same number, and the old loop then
+reads the new connection's bytes. The app opens a short-lived connection per
+request plus one per status stream, so fd numbers are reused constantly.
+
+**Fix:** Only the read loop closes the fd.
+
+- `close()`: under the lock, return if already `closed`; otherwise set
+  `closed = true` and take `fd`. Outside the lock, call
+  `shutdown(fd, SHUT_RDWR)`. This wakes the blocked `read()`, which returns
+  0. Do **not** call `Darwin.close` here.
+- `readLoop()`: on exit, under the lock, take `fd` and set it to -1.
+  Outside the lock, call `Darwin.close`. Then call `onClosed` if
+  `close()` was not called.
+- `write()`: guard on `!closed && fd >= 0`.
+- The failure paths in `open()` already close their own handle. Leave them.
+- `close()` called from inside `onLine`, which happens on the read queue
+  (`request`'s `finish` does this), must still work: the shutdown makes the
+  next `read()` return 0.
+
+**Tests:**
+
+- Add a multi-connection fake server to the test target: it accepts in a
+  loop and answers each line with
+  `{"id":<same id>,"result":{"token":<params.token>}}`.
+- Fire 200 concurrent `HerdrClient.request("echo", params: ["token": i])` and
+  assert that every reply carries its own `i`. Crosstalk would show up as a
+  mismatched token.
+- Also run the TSan command from M1 over the new test.
+
+### M3. Fast dial turns can interleave slash commands
+
+**Where:** `Sources/WLMicroManager/TuneController.swift`, `handleDial` and
+`handleJoystick`.
+
+**Problem:** Each dial detent or joystick deflection starts its own `Task`.
+`send(command:to:)` is two separate requests (`sendText`, then `sendKeys
+["enter"]`). Two tasks in flight can produce
+`/effort high/effort xhigh⏎` followed by a stray `⏎`.
+
+**Fix:**
+
+1. Add a tiny `@MainActor final class SerialTaskQueue` to WLKit, in its own
+   file. `enqueue(_ work: @escaping @MainActor () async -> Void)` chains
+   each new `Task` after the previous one (`await previous?.value`).
+2. `TuneController` owns one queue, and both `handleDial` and
+   `handleJoystick` enqueue on it, so dial and joystick commands to a pane
+   stay ordered relative to each other.
+3. Do not coalesce detents. Each detent is one step on the ladder, and the
+   index bookkeeping relies on that.
+
+**Tests:** `SerialTaskQueueTests`. Enqueue work items with different sleeps
+and assert they complete in enqueue order and never overlap (a counter of
+items in flight never exceeds 1).
+
+### M4. `but status --json` parsing breaks on any stderr output
+
+**Where:** `Sources/WLKit/GitButler.swift`, `landPlan` and `launch`.
+
+**Problem:** `launch` sends stdout and stderr to one pipe, and `landPlan`
+parses the combined text as JSON. A single warning on stderr, such as an
+update notice or a deprecation, makes Land fail with "`but status --json`
+returned something unexpected."
+
+**Fix:**
+
+1. Give `launch` a `separateStderr: Bool` parameter. When it is true, wire
+   stdout and stderr to separate pipes and drain stderr **concurrently** (a
+   global queue plus a `DispatchGroup`), so a chatty stderr cannot deadlock
+   the stdout read.
+2. Add `errorText: String` to `StatusOutput`. It is empty when the streams
+   are merged.
+3. `landPlan` uses `color: false, separateStderr: true` and parses stdout
+   only. On failure, the thrown message is the trimmed stderr, falling back
+   to stdout.
+4. `status` and `land`, which are shown to the user, keep the merged single
+   pipe. The comment there explains why.
+5. Testing seam: make `launch` internal (not private), and add an internal
+   `landPlan(in:binary:timeout:)` that the public `landPlan(in:timeout:)`
+   calls with `locateBinary()`.
+
+**Tests:** write temporary executable shell scripts in a temp dir (chmod
+755):
+
+- one prints `warning: x` to stderr and `{"stacks":[]}` to stdout →
+  `landPlan` returns `[]`
+- one prints an error to stderr and exits 1 → the thrown message contains
+  that error
+
+### L1. A slow `agent.list` can paint over a newer one
+
+**Where:** `BridgeController.refresh()`.
+
+**Problem:** Several refreshes can be in flight at once: the poll, the
+debounced events and the tunnel state changes. Whichever finishes **last**
+wins, even if it was issued first, so stale agents can show until the next
+poll (2.5 s). This is more likely over an SSH tunnel.
+
+**Fix:** Add `refreshIssued` and `refreshApplied` counters. Take
+`let seq = refreshIssued + 1` before the fetch. After the fetch, return
+unless `seq > refreshApplied`, then set `refreshApplied = seq` and continue.
+Apply this only to the success path. The error path keeps its existing
+guards.
+
+**Test:** in `BridgeReentrancyTests`, extend `Gate` (or add a sibling) so
+each held call can be released on its own. Start the bridge, gate
+`listAgents`, start two `forceRepaint()` calls, release the second with
+`[B]` and then the first with `[A]`, and assert that `bridge.agents == [B]`.
+
+### L2. A cancelled reopen task can clear its successor
+
+**Where:** `BridgeController.scheduleReopen()`.
+
+**Problem:** After `stop()`, the cancelled task wakes up from
+`Task.sleep`. It does not check for cancellation, so if the bridge is
+running again it calls `openDevice()` once more. It then sets
+`reopenTask = nil` unconditionally, which can drop the handle of the new
+task that a later `start()` created.
+
+**Fix:**
+
+- After the sleep: `guard !Task.isCancelled, let self, self.isRunning else { return }`.
+- At the end, clear `reopenTask` only if the task was not cancelled. A
+  cancelled task's slot already belongs to `stop()`.
+
+No test: there is no seam that makes `openDevice` fail on the emulator. Note
+that in the PR, and do not add a seam just for this.
+
+### L3. `WLDevice` does not disconnect on deinit
+
+**Where:** `Sources/WLKit/WLDevice.swift`, `deinit`.
+
+**Problem:** The input and removal callbacks are registered with an
+**unretained** `self`. A connected device that is released without
+`disconnect` leaves IOKit calling into freed memory, including the freed
+`inputBuffer`.
+
+**Fix:** `deinit { disconnect(reason: nil); inputBuffer.deallocate() }`.
+The deallocation must come after the disconnect.
+
+### L4. The panel's on/off switch toggles instead of setting
+
+**Where:** `MenuPanelView.header`, the `Toggle` binding's `set`.
+
+**Problem:** It persists `on` but calls `bridge.toggle()`. If the displayed
+state is stale, the click does the opposite of what the switch shows.
+
+**Fix:** `if on { await bridge.start() } else { await bridge.stop() }`.
+
+### L5. Remotes are reloaded when *any* window becomes key
+
+**Where:** `MenuPanelView`, `.onReceive(NSWindow.didBecomeKeyNotification)`.
+
+**Problem:** It fires for every window in the app, such as the emulator
+window, and re-reads `config.json` each time. The likely worst case is a
+re-applied remote that restarts the tunnel.
+
+**Fix:** Capture the panel's own window with a minimal `NSViewRepresentable`
+that reports `view.window`, and ignore notifications whose `object` is not
+that window. Keep `.onAppear`.
+
+### L6. Tune state survives a target switch
+
+**Where:** `TuneController`: `claudeEffortIndex`, `claudeModelIndex` and the
+codex picker state.
+
+**Problem:** These are keyed by pane id, and pane ids are only unique per
+Herdr server. After a switch, a pane on the new server can inherit another
+pane's ladder position.
+
+**Fix:** Add `TuneController.resetForTargetChange()`. It clears the
+dictionaries and the picker state and hides `TunePanelController`. Call it
+from the `bridge.onTargetChange` wiring that Phase 1 moved into
+`AppDelegate`.
+
+### L7. A rejected subscription is treated as ready
+
+**Where:** `HerdrEventStream.start()`, the first-line handling.
+
+**Problem:** The first line is taken as the acknowledgement even when it is
+`{"error":…}`. The stream then sits forever with no events. Separately,
+`stopped` and `ready` are touched from the main thread and from the socket
+queue without synchronization.
+
+**Fix:**
+
+- If the first line has an `error`, mark the stream stopped and close the
+  connection. Then dispatch `onClosed(HerdrError.api(message))` to main.
+  `onReady` is never called. The bridge's existing lifecycle retry (2 s)
+  and the poll cover recovery; do not change the bridge.
+- Guard `stopped` and `ready` with an `NSLock`, as `SocketConnection` does.
+
+**Test:** `FakeHerdrServer` answers the subscribe with
+`{"id":"wl_sub","error":{"message":"nope"}}`. Assert that `onClosed` is
+called with `.api("nope")` and that `onReady` is never called.
+
+### L8. `askLoginShell` has no timeout
+
+**Where:** `GitButler.askLoginShell()`.
+
+**Problem:** A login shell whose profile blocks (a prompt, a hung network
+mount) stalls the `but` lookup, and with it Stack and Land, forever.
+
+**Fix:** The same watchdog as `launch`: terminate after 10 s and return
+`nil`. `nil` is already not cached, so the next press retries.
+
+### L9. Outdated keymap error message
+
+**Where:** `BridgeController.ensureKeymap()`.
+
+**Problem:** It says "bound to KV_OAI_AG00..AG06". The app now binds AG00
+through AG12 on the keys, plus AG13 to AG18 on the dial and joystick.
+
+**Fix:** Use a range-free message, for example: "Not every key, the dial and
+the joystick are bound to their KV_OAI_AG* codes, so some keys will stay
+dark and some presses will do nothing. Turn on keymap management or rebind
+them."
+
+### L10. Compiler warnings
+
+A clean build at `c72fefe` has these warnings:
+
+- six `ImplicitStrongCapture` warnings in `MicroManagerApp.swift`. Phase 1
+  (H1) removes these.
+- one `SendableClosureCaptures` warning in `WLDevice+Async.swift:19`
+  (`self` captured in `DispatchQueue.main.async`).
+
+**Fix for the second:** `WLDevice` is confined to the main queue. Every
+callback is already dispatched there, and `callAsync` hops there. Declare
+`extension WLDevice: @unchecked Sendable {}` with a comment stating that
+confinement, next to the class's existing note on callbacks.
+
+**Check:** a clean build (`swift build --build-path <tmp dir>`) shows zero
+warnings.
+
+---
+
+## Part 2 — Phased ToDo
+
+### Phase 1 — Start the bridge at launch (H1)
+
+Branch `fix/review-1-launch` · PR title `fix: start the bridge at launch, not on first panel open`
+
+- [ ] `AppDelegate` is `@MainActor` and owns `let bridge = BridgeController()`.
+- [ ] Wiring moved from the `.task` into `AppDelegate`, called from
+      `applicationDidFinishLaunching`, followed by the bootstrap `Task`
+      (emulator, then target, then start-if-enabled, in that order).
+- [ ] `MicroManagerApp`: no `@StateObject`; `.environmentObject(delegate.bridge)`;
+      label extracted to `MenuBarLabel` with `@ObservedObject`; `.task` removed.
+- [ ] No `[weak bridge]` captures left; zero `ImplicitStrongCapture` warnings.
+- [ ] Headless check from H1 done; before/after socket counts recorded in
+      Notes.
+- [ ] PR lists the user checks from H1.
+- [ ] Remove the "Manual check so far" paragraph at the end of
+      `design/remote-herdr-todo.md` Phase 4, or point it at this phase.
+- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+### Phase 2 — Land only what was confirmed (H2)
+
+Branch `fix/review-2-land-scope` · PR title `fix: land only the branches the user confirmed`
+
+- [ ] `GitButler.LandStep` and `GitButler.nextLandStep(plan:confirmed:landed:)`
+      with the five rules in H2.
+- [ ] `LandPanelController.land()` captures `confirmed` before the first
+      `await` and loops on `nextLandStep`; `.stop` messages go to the panel;
+      `maxLands` kept.
+- [ ] Tests for all five cases listed in H2.
+- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+### Phase 3 — Herdr socket concurrency (M1, M2, L7)
+
+Branch `fix/review-3-herdr-socket` · PR title `fix: race-free herdr requests and socket teardown`
+
+- [ ] M1: `request` guards `finished` with a lock (same pattern as
+      `SSHTunnel.probe`).
+- [ ] M1 test: a late timeout after a reply is harmless.
+- [ ] M2: `close()` only shuts the socket down; `readLoop` alone closes the fd;
+      `write()` checks `closed`.
+- [ ] M2 test: 200 concurrent echo requests against a multi-connection fake
+      server, each getting its own token back.
+- [ ] L7: an error acknowledgement closes the stream with `HerdrError.api`
+      and never calls `onReady`; `stopped`/`ready` lock-protected.
+- [ ] L7 test with `FakeHerdrServer`.
+- [ ] **verify** TSan run (`--sanitize=thread`) over the socket tests,
+      before and after; results in Notes.
+- [ ] `SSHTunnelTests` and `BridgeReentrancyTests` still pass (both use
+      `SocketConnection`, directly or through the bridge).
+- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+### Phase 4 — Ordered dial and joystick commands (M3, L6)
+
+Branch `fix/review-4-tune-order` · PR title `fix: send dial and joystick commands in order`
+
+- [ ] `WLKit/SerialTaskQueue.swift` plus `SerialTaskQueueTests` (order, no
+      overlap).
+- [ ] `TuneController.handleDial` and `handleJoystick` enqueue on one shared
+      queue.
+- [ ] L6: `TuneController.resetForTargetChange()`, called from
+      `onTargetChange` in `AppDelegate`.
+- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+### Phase 5 — `but` output handling (M4, L8)
+
+Branch `fix/review-5-but-output` · PR title `fix: keep but's stderr out of the land plan JSON`
+
+- [ ] `launch(…, separateStderr:)` with stderr drained concurrently;
+      `StatusOutput.errorText`.
+- [ ] `landPlan` parses stdout only; the failure message prefers stderr;
+      internal `landPlan(in:binary:timeout:)` seam.
+- [ ] `status` and `land` unchanged (merged output, colour forced).
+- [ ] Tests with temporary script binaries (stderr warning plus valid JSON;
+      failure with stderr).
+- [ ] L8: `askLoginShell` watchdog (10 s, returns nil).
+- [ ] `LiveGitButlerTests` still pass or skip as before.
+- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+### Phase 6 — Bridge, device and panel polish (L1, L2, L3, L4, L5, L9, L10)
+
+Branch `fix/review-6-polish` · PR title `fix: bridge and panel robustness`
+
+- [ ] L1: refresh sequencing, plus the out-of-order test in
+      `BridgeReentrancyTests`.
+- [ ] L2: the reopen task checks cancellation after its sleep and only clears
+      its own slot.
+- [ ] L3: `WLDevice.deinit` disconnects before deallocating the buffer.
+- [ ] L4: the panel switch calls `start()`/`stop()` according to `on`.
+- [ ] L5: key-window reloads limited to the panel's own window.
+- [ ] L9: range-free keymap error message.
+- [ ] L10: `WLDevice` declared `@unchecked Sendable` with a confinement
+      comment; a clean build has zero warnings.
+- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+### Done
+
+- [ ] All six PRs merged; set this file's status to "implemented (PRs #…)".
+
+---
+
+## Found during implementation
+
+(Problems discovered while working through the phases go here, not into the
+current PR.)
