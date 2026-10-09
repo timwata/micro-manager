@@ -76,6 +76,39 @@ final class FakeHerdrServer: @unchecked Sendable {
     }
 }
 
+/// A server that hangs up on each connection without reading a byte or
+/// replying: Herdr going away with connections in its backlog, or ssh
+/// dropping a forwarded connection because nothing listens at the remote
+/// path. Accepts exactly `connections` clients.
+///
+/// It waits until the client's first bytes are pending (or a second has
+/// passed) before closing. Closing straight after `accept` races the client:
+/// its read loop sees the hang-up first and gives up the fd, and its `write`
+/// then never touches the socket at all.
+final class HangUpHerdrServer: @unchecked Sendable {
+    let path: String
+    private let listener: Int32
+
+    init(connections: Int = 1) throws {
+        (path, listener) = try listenOnTemporarySocket(backlog: 8)
+        let listener = self.listener
+        Thread.detachNewThread {
+            for _ in 0..<connections {
+                let client = accept(listener, nil, nil)
+                guard client >= 0 else { return }
+                var pending = pollfd(fd: client, events: Int16(POLLIN), revents: 0)
+                _ = poll(&pending, 1, 1000)
+                close(client)
+            }
+        }
+    }
+
+    deinit {
+        close(listener)
+        unlink(path)
+    }
+}
+
 /// A server that, like Herdr, answers one request per connection, for any
 /// number of connections at once: each request gets back
 /// `{"id":<its id>,"result":{"token":<params.token>}}`, and the connection is

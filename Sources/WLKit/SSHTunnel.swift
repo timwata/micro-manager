@@ -546,7 +546,9 @@ public final class SSHTunnel {
     // MARK: - Plumbing
 
     /// One request through the forward. Any reply counts — even an error is
-    /// proof that a Herdr is on the other end.
+    /// proof that a Herdr is on the other end. `finish` holds `conn`
+    /// strongly, as in `HerdrClient.request`; the connection breaks that
+    /// cycle itself.
     private static func probe(_ path: String, timeout: TimeInterval) async -> Bool {
         await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             let conn = SocketConnection(path: path)

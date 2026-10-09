@@ -231,7 +231,9 @@ public enum HerdrClient {
             // A reply or close (the socket's queue), the timeout (a global
             // queue) and an open failure (this thread) can all finish at
             // once; resuming twice is fatal, so only the first one through
-            // the lock gets to.
+            // the lock gets to. It holds `conn` strongly on purpose: nothing
+            // else keeps the connection alive until the reply, and the
+            // connection drops its callbacks, and so this cycle, once done.
             let lock = NSLock()
             var finished = false
             let finish: (Result<[String: Any], Error>) -> Void = { result in
@@ -486,6 +488,13 @@ public final class HerdrEventStream {
 /// number, and the loop — already past its check — would read that
 /// connection's bytes. Every request opens its own connection, so numbers are
 /// reused constantly.
+///
+/// Callers' callbacks usually capture the connection strongly (a request's
+/// `finish` closes it), which makes a cycle. The connection breaks it itself
+/// once neither callback can fire again: when the read loop ends, or when
+/// `open()` fails and no loop ever starts. Callers must not capture it weakly
+/// instead — the loop holds it only weakly, so nothing would keep it alive
+/// until the reply.
 final class SocketConnection: @unchecked Sendable {
     var onLine: ((String) -> Void)?
     var onClosed: ((Error?) -> Void)?
@@ -499,10 +508,39 @@ final class SocketConnection: @unchecked Sendable {
 
     init(path: String) { self.path = path }
 
+    /// On failure the callbacks are dropped before throwing: no read loop
+    /// will ever run to drop them, and the caller reports the error through
+    /// its own reference to them.
     func open() throws {
+        do {
+            try connect()
+        } catch {
+            onLine = nil
+            onClosed = nil
+            throw error
+        }
+        queue.async { [weak self] in self?.readLoop() }
+    }
+
+    private func connect() throws {
         let handle = socket(AF_UNIX, SOCK_STREAM, 0)
         guard handle >= 0 else {
             throw HerdrError.cannotConnect(path, String(cString: strerror(errno)))
+        }
+
+        // Without this, writing to a peer that has already closed raises
+        // SIGPIPE, whose default action kills the whole app — Herdr exiting
+        // with connections in its backlog, or ssh dropping a forwarded
+        // connection because nothing listens at the remote path, which is
+        // what the tunnel's readiness probe meets every 0.2 s. With it the
+        // write fails with EPIPE and `write` gives up. Per socket rather than
+        // `signal(SIGPIPE, SIG_IGN)`: a library should not change the
+        // process-wide disposition.
+        var one: Int32 = 1
+        guard setsockopt(handle, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            let reason = String(cString: strerror(errno))
+            Darwin.close(handle)
+            throw HerdrError.cannotConnect(path, reason)
         }
 
         var addr = sockaddr_un()
@@ -529,7 +567,6 @@ final class SocketConnection: @unchecked Sendable {
         }
 
         lock.lock(); fd = handle; lock.unlock()
-        queue.async { [weak self] in self?.readLoop() }
     }
 
     func write(_ data: Data) {
@@ -568,6 +605,11 @@ final class SocketConnection: @unchecked Sendable {
             lock.unlock()
             if handle >= 0 { Darwin.close(handle) }
             if !wasClosed { onClosed?(nil) }
+            // Neither callback can fire again, so let go of whatever they
+            // captured — usually this connection. Safe without the lock:
+            // they are set before `open()` and only read on this queue.
+            onLine = nil
+            onClosed = nil
         }
         guard handle >= 0 else { return }
 
