@@ -90,7 +90,8 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var emulator: PadEmulator?
     private var lifecycle: HerdrEventStream?
     private var statusStreams: [String: HerdrEventStream] = [:]
-    private var pollTask: Task<Void, Never>?
+    /// Internal so tests can check that no poll loop outlives its target.
+    private(set) var pollTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var reopenTask: Task<Void, Never>?
     private var lastFingerprint: String?
@@ -101,11 +102,19 @@ public final class BridgeController: ObservableObject {
     /// The ssh the tunnel runs. A seam for live tests, which reach a
     /// throwaway sshd through a wrapper script rather than `~/.ssh/config`.
     var sshPath = "/usr/bin/ssh"
+    /// Where `refresh()` reads agents from. A seam for tests, which hold a
+    /// read open to land a stop or a switch in the middle of it.
+    var listAgents: @MainActor () async throws -> [HerdrAgent] = { try await HerdrClient.listAgents() }
     /// Whether the Herdr side — socket path, tunnel, streams, poll — is up
     /// for the current target. Separate from `isRunning` because the device
-    /// opens first, and a refresh in that gap would read whatever socket the
-    /// previous target left behind.
+    /// opens first: until `start()` has opened it and ensured the keymap,
+    /// nothing may refresh — a refresh would paint keys that may not be bound
+    /// yet, and read whatever socket the previous target left behind.
     private var herdrActive = false
+    /// True while `start()` is between turning on and `startHerdr()`: the
+    /// device side is still opening, and `start()` will bring up whatever the
+    /// target is by then.
+    private var openingDevice = false
     /// Bumped on every Herdr teardown. Callbacks and replies that were set up
     /// under an older value belong to a target the pad no longer mirrors —
     /// a superseded tunnel's state change, a closed stream's retry, an
@@ -168,12 +177,17 @@ public final class BridgeController: ObservableObject {
         contendingClient = false
         keyBindings = KeyBindings.load()
 
+        openingDevice = true
         await openDevice()
+        openingDevice = false
         await startHerdr()
     }
 
     public func stop() async {
         isRunning = false
+        // A start() still opening the device finds isRunning false and stops
+        // there; clearing this now keeps a quick stop/start from inheriting it.
+        openingDevice = false
         reopenTask?.cancel(); reopenTask = nil
         teardownHerdr()
         await teardownDevice()
@@ -193,6 +207,9 @@ public final class BridgeController: ObservableObject {
         teardownHerdr()
         // Whatever went wrong was about the server the pad just left.
         lastError = nil
+        // start() is still opening the pad: it brings up the new target
+        // itself, and must be the first to paint, once the keymap is ensured.
+        guard !openingDevice else { return }
         let generation = herdrGeneration
         await render([])
         // Another switch, or a stop, may have come in during the repaint;
@@ -221,6 +238,7 @@ public final class BridgeController: ObservableObject {
     private func startHerdr() async {
         guard isRunning, !herdrActive else { return }
         herdrActive = true
+        let generation = herdrGeneration
 
         switch target {
         case .local:
@@ -228,7 +246,6 @@ public final class BridgeController: ObservableObject {
             link = .local
         case .remote(let remote):
             let tunnel = SSHTunnel(remote: remote, sshPath: sshPath)
-            let generation = herdrGeneration
             tunnel.onStateChange = { [weak self] state in
                 guard let self, generation == self.herdrGeneration else { return }
                 self.tunnelChanged(state)
@@ -244,8 +261,11 @@ public final class BridgeController: ObservableObject {
 
         startLifecycleStream()
         await refresh()
+        // A stop or a switch during the refresh owns the Herdr side now; a
+        // poll started here would carry its generation and never be dropped.
+        guard isRunning, generation == herdrGeneration else { return }
 
-        let generation = herdrGeneration
+        pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let interval = self?.config.pollInterval else { return }
@@ -327,8 +347,9 @@ public final class BridgeController: ObservableObject {
     private func openDevice() async {
         // Ask for Input Monitoring explicitly. hidapi-style opens just fail
         // with a privilege violation without ever raising the prompt, which
-        // reads as a bug rather than a permission.
-        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+        // reads as a bug rather than a permission. The virtual pad needs none.
+        if device.emulator == nil,
+           IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
             _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
         }
 
@@ -487,7 +508,7 @@ public final class BridgeController: ObservableObject {
         var fetched: [HerdrAgent] = []
         if linkUp {
             do {
-                fetched = try await HerdrClient.listAgents()
+                fetched = try await listAgents()
             } catch {
                 // A switch or a dropped link since the request went out makes
                 // the error about something the UI no longer shows.
