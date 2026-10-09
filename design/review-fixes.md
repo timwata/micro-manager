@@ -1,6 +1,6 @@
 # Fix plan: code review of `main` (2026-10-09)
 
-Status: in progress. Phases 1–4 implemented.
+Status: in progress. Phases 1–5 implemented.
 
 Source: a whole-repo review of `main` at `c72fefe`. Build and tests were green
 at that commit (169 tests, 0 failures, 11 skipped). Each finding below has an
@@ -677,16 +677,55 @@ Notes:
 
 Branch `fix/review-5-but-output` · PR title `fix: keep but's stderr out of the land plan JSON`
 
-- [ ] `launch(…, separateStderr:)` with stderr drained concurrently;
+- [x] `launch(…, separateStderr:)` with stderr drained concurrently;
       `StatusOutput.errorText`.
-- [ ] `landPlan` parses stdout only; the failure message prefers stderr;
+- [x] `landPlan` parses stdout only; the failure message prefers stderr;
       internal `landPlan(in:binary:timeout:)` seam.
-- [ ] `status` and `land` unchanged (merged output, colour forced).
-- [ ] Tests with temporary script binaries (stderr warning plus valid JSON;
+- [x] `status` and `land` unchanged (merged output, colour forced).
+- [x] Tests with temporary script binaries (stderr warning plus valid JSON;
       failure with stderr).
-- [ ] L8: `askLoginShell` watchdog (10 s, returns nil).
-- [ ] `LiveGitButlerTests` still pass or skip as before.
-- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+- [x] L8: `askLoginShell` watchdog (10 s, returns nil).
+- [x] `LiveGitButlerTests` still pass or skip as before.
+- [x] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+Notes:
+
+- The tests are a new `GitButlerOutputTests`, with `/bin/sh` scripts written
+  to a temp dir standing in for `but` and for the login shell. Besides the
+  two in M4: a failure with nothing on stderr falls back to stdout; 200 KB of
+  stderr before any stdout (more than a pipe buffers) still parses, in well
+  under the timeout; merged output keeps both streams in order with an empty
+  `errorText`. Mutation-checked: with merged streams in `landPlan` the
+  warning and stderr tests fail, and with stderr read after stdout instead of
+  concurrently the 200 KB test fails (the watchdog kills the script after 5 s).
+- `launch` is internal and takes `separateStderr` without a default. A
+  private `run(_ binary:_:in:color:separateStderr:timeout:)` does the
+  dispatch for both the public `run` (whose signature is unchanged; it stays
+  merged) and the `landPlan` seam. `StatusOutput.errorText` defaults to `""`.
+- If a failed `but status --json` says nothing on either stream, the message
+  is still empty, as before. Left alone (scope).
+- **L8 deviation:** not the same watchdog as `launch`. Verified here:
+  `Process.terminate()` also takes down the shell's child in its process
+  group (a `sleep` under `sh` was gone right after), so a profile blocked in
+  an ordinary child is covered either way. But a child in a group of its own
+  (`set -m; sleep 5 & wait`) survives, keeps the stdout pipe open, and
+  terminate-then-read-to-EOF still blocked for the child's full lifetime. The
+  same goes for a shell stuck in the kernel on a hung mount, the plan's own
+  example, which does not die until the call returns. So `askLoginShell`
+  reads on a global queue and waits on a `DispatchGroup` for at most 10 s; on
+  timeout it terminates the shell and returns `nil` without waiting for the
+  reader, which is left to finish when the pipe closes. The shell also gets
+  `/dev/null` as stdin, so a profile that prompts reads EOF instead of
+  waiting. Seam: internal `askLoginShell(_ shell:timeout:)`. Tests: a fake
+  shell's answer is used; the `set -m` shell gives up within 3 s at a 0.5 s
+  timeout (mutation-checked: with the terminate-then-read watchdog it took
+  5.4 s and failed).
+- `launch` keeps its terminate-then-read watchdog, so a `but` child that left
+  the process group could still hold it past the timeout. Not changed here
+  (scope); `but` is not known to do that.
+- `LiveGitButlerTests` skip here: there is no `but` on this machine (the
+  lookup, login shell included, comes back `nil`). Full suite: 192 tests,
+  0 failures, 5 skipped. The only build warning left is L10's, for Phase 6.
 
 ### Phase 6 — Bridge, device and panel polish (L1, L2, L3, L4, L5, L9, L10)
 
