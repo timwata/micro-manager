@@ -47,10 +47,14 @@ final class TuneController {
     /// on the ladder, and the index bookkeeping counts on that.
     private let queue = SerialTaskQueue()
 
-    /// Bumped by `resetForTargetChange()`. Work that was already waiting on
-    /// the old server when the target changed checks it once it has the
-    /// focused pane, and again before any state it writes after a send, so it
-    /// neither writes state keyed by an old pane id nor carries on.
+    /// Bumped by `resetForTargetChange()`. Each item takes it when it is
+    /// enqueued, not when it starts: an item still waiting in the queue at a
+    /// target change would otherwise start after the switch, read the new
+    /// generation as its own and act on the new target's focused pane. An
+    /// item checks it when it starts, once it has the focused pane, and again
+    /// before any state it writes after a send, so work aimed at the old
+    /// server neither reaches the new one nor writes state keyed by an old
+    /// pane id.
     private var generation = 0
 
     /// Pane ids are only unique per Herdr server, so on a target change all
@@ -70,11 +74,12 @@ final class TuneController {
     // MARK: - Dial: effort
 
     func handleDial(_ step: Int) {
-        queue.enqueue { [self] in await dial(step) }
+        let generation = generation
+        queue.enqueue { [self] in await dial(step, generation: generation) }
     }
 
-    private func dial(_ step: Int) async {
-        let generation = generation
+    private func dial(_ step: Int, generation: Int) async {
+        guard generation == self.generation else { return }
         guard let (agent, pane) = await focusedPane(), generation == self.generation else { return }
         let kind = agent.agent.lowercased()
         do {
@@ -106,11 +111,12 @@ final class TuneController {
     // MARK: - Joystick: model
 
     func handleJoystick(_ direction: Pad.JoystickDirection) {
-        queue.enqueue { [self] in await joystick(direction) }
+        let generation = generation
+        queue.enqueue { [self] in await joystick(direction, generation: generation) }
     }
 
-    private func joystick(_ direction: Pad.JoystickDirection) async {
-        let generation = generation
+    private func joystick(_ direction: Pad.JoystickDirection, generation: Int) async {
+        guard generation == self.generation else { return }
         guard let (agent, pane) = await focusedPane(), generation == self.generation else { return }
         let kind = agent.agent.lowercased()
         do {

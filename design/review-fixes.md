@@ -649,6 +649,22 @@ Notes:
   index before sending, with no `await` in between, so one check covers
   them. `onTargetChange` runs before `teardownHerdr()` with no `await`
   between, so no queued item can start in that gap.
+- **Review follow-up (PR #12):** that only covered work already running.
+  The queue adds a wait the bare `Task`s never had, and a backlog builds
+  whenever items are slow (several round trips per detent over the tunnel,
+  or 5 s timeouts on a stalled link). An item still queued at a target
+  change started after the switch, took the bumped generation as its own
+  and sent `/effort …` to the new target's focused pane. `handleDial` and
+  `handleJoystick` now take the generation when they enqueue and pass it
+  down; `dial` and `joystick` check it before `focusedPane()` (no
+  `agent.list` against the new target, no "Nothing has focus" error) and
+  again after it, as before. `TuneController` is in the app target and
+  calls `HerdrClient` and `TunePanelController.shared` directly, so the
+  test drives the rule rather than the controller:
+  `SerialTaskQueueTests.testItemQueuedBeforeAGenerationBumpDropsItself`
+  blocks one item, enqueues a second, bumps the generation while the first
+  is blocked, and checks that the second does nothing while an item
+  enqueued after the bump runs.
 - The Codex steering branch was restructured to send its key first and then
   update state, so the generation check sits in one place; the keys sent and
   the state changes per direction are the same as before.

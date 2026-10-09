@@ -49,4 +49,41 @@ final class SerialTaskQueueTests: XCTestCase {
         XCTAssertEqual(log, ["a", "b", "c"])
         await first.value
     }
+
+    /// The queue itself drops nothing, so an item still waiting when the
+    /// target changes starts after the switch. `TuneController` handles that
+    /// by taking its generation at enqueue time; this is that rule, with a
+    /// blocked item ahead and the generation bumped while it is blocked.
+    /// (`TuneController` lives in the app target and talks to Herdr and a
+    /// panel singleton directly, so it is not driven here.)
+    func testItemQueuedBeforeAGenerationBumpDropsItself() async {
+        let queue = SerialTaskQueue()
+        var generation = 0
+        var log: [String] = []
+        var release: CheckedContinuation<Void, Never>?
+
+        let blocker = queue.enqueue {
+            await withCheckedContinuation { release = $0 }
+            log.append("blocker")
+        }
+        let staleGeneration = generation
+        queue.enqueue {
+            guard staleGeneration == generation else { return }
+            log.append("stale")
+        }
+        while release == nil { await Task.yield() }
+
+        generation += 1
+        let freshGeneration = generation
+        let fresh = queue.enqueue {
+            guard freshGeneration == generation else { return }
+            log.append("fresh")
+        }
+
+        release?.resume()
+        await fresh.value
+
+        XCTAssertEqual(log, ["blocker", "fresh"])
+        await blocker.value
+    }
 }
