@@ -87,11 +87,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard index != Pad.landKeyID else { return false }
             return land.handleOtherKey()
         }
-        // What the two windows show — and a pending land confirmation —
-        // belongs to the server the pad just left.
+        // What the windows show — and a pending land confirmation, and the
+        // tune state keyed by pane id — belongs to the server the pad just
+        // left.
         bridge.onTargetChange = { _ in
             stack.close()
             land.closeForTargetChange()
+            tune.resetForTargetChange()
         }
     }
 }
