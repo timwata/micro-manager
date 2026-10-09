@@ -228,10 +228,18 @@ public enum HerdrClient {
         try await withCheckedThrowingContinuation { continuation in
             let target = currentTarget()
             let conn = SocketConnection(path: target.path)
+            // A reply or close (the socket's queue), the timeout (a global
+            // queue) and an open failure (this thread) can all finish at
+            // once; resuming twice is fatal, so only the first one through
+            // the lock gets to.
+            let lock = NSLock()
             var finished = false
             let finish: (Result<[String: Any], Error>) -> Void = { result in
-                guard !finished else { return }
+                lock.lock()
+                let first = !finished
                 finished = true
+                lock.unlock()
+                guard first else { return }
                 conn.close()
                 // Whatever the old target said — agents, focus, an error — is
                 // about a server the caller no longer mirrors.
@@ -363,7 +371,8 @@ public enum HerdrClient {
 // MARK: - Event streams
 
 /// One subscription, on its own connection. The first line is the
-/// acknowledgement; everything after it is a pushed event.
+/// acknowledgement — or a refusal, which ends the stream — and everything
+/// after it is a pushed event.
 public final class HerdrEventStream {
     public var onReady: (() -> Void)?
     public var onEvent: (([String: Any]) -> Void)?
@@ -373,6 +382,10 @@ public final class HerdrEventStream {
     /// Created in `start()`, not `init`, so a stream built before a target
     /// switch and started after it subscribes to the new target.
     private var conn: SocketConnection?
+    /// `stopped` is set by `stop()` on the caller's thread and by a refused
+    /// subscription on the socket's queue, and read on both; `ready` goes
+    /// with it.
+    private let lock = NSLock()
     private var ready = false
     private var stopped = false
 
@@ -382,23 +395,30 @@ public final class HerdrEventStream {
 
     @discardableResult
     public func start() -> HerdrEventStream {
-        guard conn == nil, !stopped else { return self }
+        guard conn == nil, !isStopped else { return self }
         let conn = SocketConnection(path: HerdrClient.socketPath())
         self.conn = conn
-        conn.onLine = { [weak self] line in
-            guard let self, !self.stopped else { return }
-            guard let data = line.data(using: .utf8),
+        conn.onLine = { [weak self, weak conn] line in
+            guard let self,
+                  let data = line.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return }
-            if !self.ready {
-                self.ready = true
-                DispatchQueue.main.async { self.onReady?() }
+            switch self.classify(object) {
+            case .ignored:
                 return
+            case .ready:
+                DispatchQueue.main.async { self.onReady?() }
+            case .refused(let message):
+                // Without this the stream would sit forever with no events.
+                // The caller's retry and poll take it from here.
+                conn?.close()
+                DispatchQueue.main.async { self.onClosed?(HerdrError.api(message)) }
+            case .event:
+                DispatchQueue.main.async { self.onEvent?(object) }
             }
-            DispatchQueue.main.async { self.onEvent?(object) }
         }
         conn.onClosed = { [weak self] error in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.isStopped else { return }
             DispatchQueue.main.async { self.onClosed?(error) }
         }
 
@@ -421,11 +441,37 @@ public final class HerdrEventStream {
     }
 
     public func stop() {
-        stopped = true
+        lock.lock(); stopped = true; lock.unlock()
         conn?.close()
     }
 
     deinit { conn?.close() }
+
+    private var isStopped: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stopped
+    }
+
+    private enum Line {
+        case ignored
+        case ready
+        case refused(String)
+        case event
+    }
+
+    /// What an incoming line means, decided under the lock so a refusal and
+    /// a `stop()` cannot both end the stream.
+    private func classify(_ object: [String: Any]) -> Line {
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped else { return .ignored }
+        if ready { return .event }
+        if let error = object["error"] as? [String: Any] {
+            stopped = true
+            return .refused(error["message"] as? String ?? "api error")
+        }
+        ready = true
+        return .ready
+    }
 }
 
 // MARK: - Socket plumbing
@@ -433,6 +479,13 @@ public final class HerdrEventStream {
 /// A blocking read loop on its own queue. Deliberately plain POSIX: the
 /// alternative is Network.framework, which adds ceremony for no benefit on a
 /// local Unix socket.
+///
+/// Only the read loop closes the fd. `close()` merely shuts the socket down,
+/// which wakes the blocked `read()`. If `close()` freed the number itself, a
+/// socket opened on another thread in the meantime could be handed the same
+/// number, and the loop — already past its check — would read that
+/// connection's bytes. Every request opens its own connection, so numbers are
+/// reused constantly.
 final class SocketConnection: @unchecked Sendable {
     var onLine: ((String) -> Void)?
     var onClosed: ((Error?) -> Void)?
@@ -475,13 +528,13 @@ final class SocketConnection: @unchecked Sendable {
             throw HerdrError.cannotConnect(path, reason)
         }
 
-        fd = handle
+        lock.lock(); fd = handle; lock.unlock()
         queue.async { [weak self] in self?.readLoop() }
     }
 
     func write(_ data: Data) {
         lock.lock(); defer { lock.unlock() }
-        guard fd >= 0 else { return }
+        guard !closed, fd >= 0 else { return }
         data.withUnsafeBytes { raw in
             var sent = 0
             while sent < raw.count {
@@ -492,21 +545,34 @@ final class SocketConnection: @unchecked Sendable {
         }
     }
 
+    /// Safe from any thread, including the read queue (a reply handler that
+    /// closes): the next `read()` returns 0 and the loop ends. The shutdown
+    /// happens under the lock because the loop may be ending on its own (the
+    /// peer closed); it gives up the fd under the same lock before closing
+    /// it, so a number seen here is still ours.
     func close() {
-        lock.lock()
-        let handle = fd
-        fd = -1
+        lock.lock(); defer { lock.unlock() }
+        guard !closed else { return }
         closed = true
-        lock.unlock()
-        if handle >= 0 { Darwin.close(handle) }
+        if fd >= 0 { shutdown(fd, SHUT_RDWR) }
     }
 
     private func readLoop() {
+        // Nobody else closes the fd, so the number stays ours until the
+        // loop below ends and closes it.
+        lock.lock(); let handle = fd; lock.unlock()
+        defer {
+            lock.lock()
+            fd = -1
+            let wasClosed = closed
+            lock.unlock()
+            if handle >= 0 { Darwin.close(handle) }
+            if !wasClosed { onClosed?(nil) }
+        }
+        guard handle >= 0 else { return }
+
         var chunk = [UInt8](repeating: 0, count: 8192)
         while true {
-            lock.lock(); let handle = fd; lock.unlock()
-            guard handle >= 0 else { break }
-
             let n = Darwin.read(handle, &chunk, chunk.count)
             if n <= 0 { break }
             buffer.append(contentsOf: chunk[0..<n])
@@ -520,7 +586,5 @@ final class SocketConnection: @unchecked Sendable {
                 }
             }
         }
-        lock.lock(); let wasClosed = closed; lock.unlock()
-        if !wasClosed { onClosed?(nil) }
     }
 }
