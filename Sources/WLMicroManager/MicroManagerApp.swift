@@ -36,11 +36,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Nothing async gets to finish here, so the remote's ssh is killed
-    /// synchronously. A crash skips this, which is what the tunnel's
-    /// stdin-EOF lifetime is for.
+    /// Nothing async gets to finish here, so the pad is switched dark and the
+    /// remote's ssh killed synchronously. A crash skips this, which is what
+    /// the tunnel's stdin-EOF lifetime is for; the pad then keeps its last
+    /// lights until the next launch repaints it.
     func applicationWillTerminate(_ notification: Notification) {
-        bridge.shutdownTunnel()
+        bridge.shutdown()
     }
 
     /// The stack and land keys open windows, which the bridge knows nothing

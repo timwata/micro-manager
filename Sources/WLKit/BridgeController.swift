@@ -236,10 +236,63 @@ public final class BridgeController: ObservableObject {
         tunnel.start()
     }
 
-    /// Kills a remote target's ssh, synchronously. Meant for
-    /// `applicationWillTerminate`, where nothing async gets to finish; the
-    /// tunnel's stdin trick already covers a crash. Nothing restarts the
-    /// tunnel afterwards short of the next `start()` or `setTarget`.
+    /// Switches the pad dark, closes it and kills a remote target's ssh, all
+    /// before returning. Meant for `applicationWillTerminate`: the process
+    /// exits as soon as that returns, so the `Task` a `stop()` would need
+    /// never runs and the pad would keep showing the last agents after quit.
+    ///
+    /// The device is sealed first. Waiting on a reply spins the run loop,
+    /// which also runs main-queue work queued before the quit — a repaint's
+    /// `callAsync` hop, say — and a lit `threads` call landing between the
+    /// two blanking calls would leave the keys lit, since thread state paints
+    /// over zone state. Sealed, those calls are refused, and the blanking
+    /// calls are the last to reach the pad.
+    ///
+    /// Each blanking call waits for its reply before the next goes out, as
+    /// every other call does; a reply to an earlier repaint call may still be
+    /// outstanding when the first one is sent. `replyTimeout` bounds each
+    /// wait, so a pad that stopped answering cannot hold up the quit for
+    /// long. The persisted on/off setting is left alone: quitting is not
+    /// switching off, and the next launch starts again.
+    public func shutdown(replyTimeout: TimeInterval = 0.5) {
+        isRunning = false
+        openingDevice = false
+        reopenTask?.cancel(); reopenTask = nil
+        teardownHerdr()
+        // Before anything spins the run loop: a repaint resumed in there
+        // finds the device gone and does not try.
+        deviceConnected = false
+        guard device.isConnected else { return }
+        device.seal()
+        for call in Self.lightsOffCalls {
+            callBlocking(call.method, params: call.params, timeout: replyTimeout)
+        }
+        device.disconnect(reason: nil)
+        clearDeviceState()
+    }
+
+    /// Sends one call and spins the main run loop until its reply or the
+    /// timeout. Only for `shutdown()`, where there is no later turn of the
+    /// run loop to await: the reply arrives through an input report (or, on
+    /// the emulator, a main-queue block), and both need the loop to run.
+    /// Called from inside a main-queue job, the main queue cannot drain, so
+    /// the reply never lands and the call waits out its timeout; the write
+    /// itself has already gone out by then. Goes through the seal
+    /// `shutdown()` puts on the device.
+    private func callBlocking(_ method: String, params: Any, timeout: TimeInterval) {
+        var answered = false
+        guard device.callThroughSeal(method, params: params, completion: { _, _ in answered = true }) != nil
+        else { return }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !answered, Date() < deadline {
+            _ = RunLoop.current.run(mode: .default, before: min(deadline, Date().addingTimeInterval(0.02)))
+        }
+    }
+
+    /// Kills a remote target's ssh, synchronously. Part of `shutdown()`, and
+    /// of every Herdr teardown; the tunnel's stdin trick already covers a
+    /// crash. Nothing restarts the tunnel afterwards short of the next
+    /// `start()` or `setTarget`.
     public func shutdownTunnel() {
         guard let tunnel else { return }
         // Its `.idle` is our own doing, not news for `link`.
@@ -353,6 +406,10 @@ public final class BridgeController: ObservableObject {
             await allLightsOff()
             device.disconnect(reason: nil)
         }
+        clearDeviceState()
+    }
+
+    private func clearDeviceState() {
         deviceConnected = false
         keyColors = [:]
         keyEffects = [:]
@@ -625,6 +682,8 @@ public final class BridgeController: ObservableObject {
         guard deviceConnected else { return }
         do {
             _ = try await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
+            // A stop or a quit may have come in while the first call was out.
+            guard isRunning, deviceConnected else { return }
             let zone = StatusMapper.zone(for: state, config) ?? .dark
             _ = try await device.callAsync(
                 OAI.methodRGBConfig,
@@ -641,15 +700,20 @@ public final class BridgeController: ObservableObject {
 
     /// Thread state paints over zone state, so clearing the zones alone leaves
     /// the pad lit. Both have to go.
-    private func allLightsOff() async {
+    private static var lightsOffCalls: [(method: String, params: Any)] {
         let threads = (0...Pad.maxThreadID).map {
             OAI.Thread(id: $0, brightness: 0, effect: .off, syncKeys: false, syncAmbient: false)
         }
-        _ = try? await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
-        _ = try? await device.callAsync(
-            OAI.methodRGBConfig,
-            params: OAI.rgbConfigParams(keys: .dark, ambient: .dark)
-        )
+        return [
+            (OAI.methodThreads, OAI.threadsParams(threads)),
+            (OAI.methodRGBConfig, OAI.rgbConfigParams(keys: .dark, ambient: .dark)),
+        ]
+    }
+
+    private func allLightsOff() async {
+        for call in Self.lightsOffCalls {
+            _ = try? await device.callAsync(call.method, params: call.params)
+        }
     }
 
     // MARK: - Key presses

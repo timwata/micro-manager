@@ -106,6 +106,9 @@ public final class WLDevice {
     private var debugAccumulator = ""
     private var pending: [Int: (Any?, String?) -> Void] = [:]
     private var nextID = 1
+    /// Set by `seal()`: `call` refuses everything, and only
+    /// `callThroughSeal` still reaches the device.
+    public private(set) var isSealed = false
 
     public var isConnected: Bool { device != nil || emulatedConnected }
 
@@ -117,6 +120,7 @@ public final class WLDevice {
 
     public func connect() throws {
         disconnect(reason: nil)
+        isSealed = false
 
         if let emulator {
             emulatedConnected = true
@@ -219,8 +223,31 @@ public final class WLDevice {
 
     // MARK: - Send
 
+    /// Makes `call` refuse everything, as if not connected, until the next
+    /// `connect()`. For a final sequence of writes that nothing may slip in
+    /// between: work already queued — a `callAsync` waiting on its main-queue
+    /// hop, a caller resumed by a reply — reaches `call` after the seal and is
+    /// turned away, while the sealer goes on through `callThroughSeal`.
+    public func seal() {
+        isSealed = true
+    }
+
     @discardableResult
     public func call(_ method: String, params: Any?, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
+        guard !isSealed else {
+            completion?(nil, Failure.notConnected.errorDescription)
+            return nil
+        }
+        return send(method, params: params, completion: completion)
+    }
+
+    /// `call`, but past a `seal()`. Only for whoever sealed the device.
+    @discardableResult
+    public func callThroughSeal(_ method: String, params: Any?, completion: ((Any?, String?) -> Void)? = nil) -> Int? {
+        send(method, params: params, completion: completion)
+    }
+
+    private func send(_ method: String, params: Any?, completion: ((Any?, String?) -> Void)?) -> Int? {
         guard emulatedConnected || device != nil else {
             completion?(nil, Failure.notConnected.errorDescription)
             return nil
