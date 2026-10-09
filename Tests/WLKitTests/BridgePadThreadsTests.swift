@@ -133,6 +133,20 @@ final class BridgeTargetTests: XCTestCase {
         XCTAssertEqual(bridge.lastError, "Stack and Land are not available for a remote Herdr.")
     }
 
+    /// A land still running when the target switched to a remote keeps its
+    /// window, and its finished report is dismissed with the land key.
+    func testRemoteLandPressReachesAnOpenLandWindow() async {
+        let bridge = BridgeController()
+        var opened: [String] = []
+        bridge.onLandKey = { opened.append("land") }
+        await bridge.setLandPanelOpen(true)
+        await bridge.setTarget(.remote(box))
+
+        bridge.handleKeyPress(Pad.landKeyID)
+        XCTAssertEqual(opened, ["land"])
+        XCTAssertNil(bridge.lastError)
+    }
+
     func testLocalStackAndLandPressesStillOpenTheirPanels() {
         let bridge = BridgeController()
         var opened: [String] = []

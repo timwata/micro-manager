@@ -659,8 +659,11 @@ public final class BridgeController: ObservableObject {
     public func handleKeyPress(_ index: Int) {
         if onKeyIntercept?(index) == true { return }
         // Dark on a remote target (see `padThreads`); say why rather than
-        // letting the press vanish.
-        if isRemote, index == Pad.stackKeyID || index == Pad.landKeyID {
+        // letting the press vanish. A land window that outlived a switch to a
+        // remote (one still running when the target changed) still owns the
+        // land key: its report says to press it again to dismiss.
+        let landKeyOwnedByPanel = index == Pad.landKeyID && landPanelOpen
+        if isRemote, index == Pad.stackKeyID || index == Pad.landKeyID, !landKeyOwnedByPanel {
             noteError("Stack and Land are not available for a remote Herdr.")
             return
         }
