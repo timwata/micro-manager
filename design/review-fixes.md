@@ -723,9 +723,25 @@ Notes:
 - `launch` keeps its terminate-then-read watchdog, so a `but` child that left
   the process group could still hold it past the timeout. Not changed here
   (scope); `but` is not known to do that.
-- `LiveGitButlerTests` skip here: there is no `but` on this machine (the
-  lookup, login shell included, comes back `nil`). Full suite: 192 tests,
-  0 failures, 5 skipped. The only build warning left is L10's, for Phase 6.
+- With `but` 0.22.3 installed (found in `~/.local/bin` by the search list,
+  not `PATH`), `LiveGitButlerTests` pass (3/3). Full suite: 192 tests,
+  0 failures, 2 skipped. The only build warning left is L10's, for Phase 6.
+- `but` 0.22.3 on a failed `status --json` (a repo without `but setup`)
+  prints a JSON error object on stdout and
+  `Error: Setup required: … - run \`but setup\` …` on stderr, so the panel
+  now shows the stderr sentence rather than the JSON plus that sentence.
+- Live land check, headless, with a temporary test (not committed) driving
+  the same loop as `LandPanelController.land()` (`landPlan` →
+  `nextLandStep` → `land`, then `status`) in a throwaway workspace: a stack
+  `bottom` ← `top` plus an independent `other`, pushing to a local bare
+  remote. The real JSON parsed to `["other", "bottom", "top"]`. With `other`
+  left out of `confirmed`, the first step stopped before it and named
+  `bottom, top` (Phase 2). With all three confirmed, they landed one by one
+  as the plan was re-read (`["bottom", "top"]`, then `["top"]`, then `[]` →
+  `.done`), and the remote's `main` ended up `base → c → a → b`. A land that
+  failed (a remote URL `but` could not reach) came back `succeeded == false`
+  with git's error in the merged `text`, as the panel shows it. Not checked:
+  the Land panel itself and the land key (no pad, no Accessibility grant).
 
 ### Phase 6 — Bridge, device and panel polish (L1, L2, L3, L4, L5, L9, L10)
 
