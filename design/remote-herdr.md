@@ -201,9 +201,14 @@ with `~/`, first run, with the same `BatchMode/ControlMaster` options:
 /usr/bin/ssh -T -o BatchMode=yes -o ControlMaster=no -o ControlPath=none <host> printenv HOME
 ```
 
-(`printenv` is a binary, so the remote login shell does not matter.) Replace
-`~` with the trimmed output; cache per host for the app's lifetime. Failure
-here is a connection failure with ssh's stderr as the message. 10 s timeout.
+(`printenv` is a binary, so the remote login shell's own syntax does not
+matter.) sshd still runs it through the login shell, whose startup files
+(bash's `~/.bashrc` on Debian-style builds, zsh's `~/.zshenv`, fish's
+`config.fish`) may echo a banner first, so the home is the **last stdout line
+that starts with `/`**. Replace `~` with it; cache per host for the app's
+lifetime. Failure here is a connection failure with ssh's stderr as the
+message, classified as permanent or transient like any other (§4.4). 10 s
+timeout.
 
 ### 4.4 Lifecycle and state
 
@@ -222,16 +227,36 @@ public final class SSHTunnel {
 ```
 
 - `start()`: state `.connecting` → resolve remote path (§4.3) → launch ssh →
-  readiness check: poll every 200 ms (max 10 s) for a successful `connect()`
-  on the local socket (a bare connect/close; Herdr tolerates a connection that
-  sends nothing — verify, else use a cheap `agent.list` request). Success →
-  `.connected`.
+  readiness check in two phases, each with its own deadline:
+  1. **Login**: poll every 200 ms for the local socket file to exist. ssh
+     binds the `-L` listener only after authentication, and the path is
+     unlinked before launch, so its appearance means "logged in".
+     `ConnectTimeout` and ssh's own exit already bound the network part, so
+     this phase only has a generous safety cap of 60 s (slow links, multi-hop
+     `ProxyJump`). Timeout → "Timed out logging in to <host>."
+  2. **Probe**: poll every 200 ms (max 10 s) with an `agent.list` request
+     through the forward; any reply → `.connected`. Timeout → "Logged in to
+     <host>, but no Herdr answered at <path>."
+
+  On either timeout, a recognised last stderr line (below) takes precedence
+  over the generic message.
 - Capture stderr into a pipe; keep the last non-empty line for error
   messages.
 - Process exits (before or after ready) while not stopped → `.failed(lastLine
-  ?? "ssh exited with status N")`, then auto-retry with backoff 3 s, 6 s, 12 s,
-  capped at 30 s; reset backoff after a successful `.connected`. Each retry
-  goes back through `.connecting`.
+  ?? "ssh exited with status N")`.
+- Failures are **permanent** or **transient**, decided from ssh's last stderr
+  line:
+  - Permanent: `Permission denied` from authentication (not the channel error
+    `open failed: connect failed: Permission denied`), `Host key verification
+    failed`, `administratively prohibited`. Retrying cannot fix these, and
+    repeated failed logins can get the Mac's IP banned by fail2ban/sshguard
+    style jails (locking the user out of interactive ssh too). Set
+    `.failed(message)` and stop: no retry until `start()` is called again
+    (or, in Phase 3, the target changes).
+  - Transient: everything else — network errors, timeouts, an exit after
+    `.connected`, no Herdr listening. Auto-retry with backoff 3 s, 6 s, 12 s,
+    capped at 30 s; reset backoff after a successful `.connected`. Each retry
+    goes back through `.connecting`.
 - Friendlier messages for common stderr (keep the raw line too):
   `Host key verification failed` → "Run `ssh <host>` once in a terminal to
   trust the host key."; `Permission denied` → "SSH key auth failed (no password
@@ -367,8 +392,10 @@ synchronous `shutdownTunnel()`). The stdin-EOF trick (§4.1) covers crashes.
 - Rapid switching: `setTarget` runs on the main actor; guard with a
   generation counter so a stale tunnel callback from a previous target is
   ignored.
-- Tunnel failing forever: retries continue at 30 s; the panel shows the last
-  error; switching back to "This Mac" stops it.
+- Tunnel failing forever: transient failures retry at 30 s; the panel shows
+  the last error; switching back to "This Mac" stops it. A permanent failure
+  (rejected key, unknown host key, forwarding disabled) is not retried; the
+  panel shows it until the user changes something and re-selects the target.
 - `raiseTerminal` unchanged (it raises the local terminal hosting ssh).
 - `contendingClient`, keymap logic and lights-off-on-stop are unaffected.
 

@@ -68,36 +68,108 @@ Notes (small additions beyond the design, no deviation in behaviour):
 Branch `feat/remote-herdr-2-tunnel` · PR title `feat: ssh tunnel to a remote herdr socket`
 · New class only; nothing calls it yet.
 
-- [ ] Add `Sources/WLKit/SSHTunnel.swift` (§4).
-  - [ ] Pure `arguments(host:localSocket:remoteSocket:)` with every option in
+- [x] Add `Sources/WLKit/SSHTunnel.swift` (§4).
+  - [x] Pure `arguments(host:localSocket:remoteSocket:)` with every option in
         §4.1, ending in `-- <host> cat >/dev/null` (the `--` keeps a host
         starting with `-` from being read as an option).
-  - [ ] Pure local socket path builder (`$TMPDIR/mm-<sanitized>.sock`,
+  - [x] Pure local socket path builder (`$TMPDIR/mm-<sanitized>.sock`,
         < 104 bytes) (§4.2).
-  - [ ] Remote `~/` expansion via `ssh … printenv HOME`, cached per host, 10 s
+  - [x] Remote `~/` expansion via `ssh … printenv HOME`, cached per host, 10 s
         timeout (§4.3). **verify** whether sshd expands `~` itself; if so,
         drop this step.
-  - [ ] Process launch with stdin `Pipe` held open, stderr captured (last
+  - [x] Process launch with stdin `Pipe` held open, stderr captured (last
         non-empty line kept).
-  - [ ] Readiness: poll `connect()` on the local socket every 200 ms, max
+  - [x] Readiness: poll `connect()` on the local socket every 200 ms, max
         10 s. **verify** Herdr tolerates a connect-and-close with no request;
         otherwise use `agent.list`.
-  - [ ] State machine `idle → connecting → connected | failed(msg)`,
+  - [x] State machine `idle → connecting → connected | failed(msg)`,
         `onStateChange` callback, backoff 3/6/12/…/30 s, reset after
         `connected` (§4.4).
-  - [ ] Friendly messages for `Host key verification failed` and
+  - [x] Friendly messages for `Host key verification failed` and
         `Permission denied` (raw line kept).
-  - [ ] `stop()`: cancel retries, close stdin, terminate, unlink local socket;
+  - [x] `stop()`: cancel retries, close stdin, terminate, unlink local socket;
         idempotent.
-- [ ] Tests: `SSHTunnelTests` (argument list, path sanitizing/length, `~`
+- [x] Tests: `SSHTunnelTests` (argument list, path sanitizing/length, `~`
       helper, message mapping).
-- [ ] Live test `LiveRemoteHerdrTests`: `XCTSkip` unless
+- [x] Live test `LiveRemoteHerdrTests`: `XCTSkip` unless
       `WL_TEST_REMOTE_HOST`; connect, `listAgents()` through the tunnel, stop,
       assert local socket removed.
-- [ ] Manual: run the live test against a real host once; confirm that after
+- [x] Manual: run the live test against a real host once; confirm that after
       killing the test process no `ssh … cat >/dev/null` remains
       (`pgrep -fl 'cat >/dev/null'`). Record result in the PR.
-- [ ] `swift test` green (live test skipped in CI).
+- [x] `swift test` green (live test skipped in CI).
+
+Verify results (OpenSSH 10.3 client and sshd, Herdr on macOS):
+
+- **sshd does not expand `~`** in a streamlocal forward path, and a relative
+  path does not resolve against the home directory either (both fail with
+  `open failed: connect failed: open failed`). The `printenv HOME` step stays.
+  The ssh client does not expand `~` there either, but it does `%`-expand
+  the path (`%h` → host), so a remote socket path containing `%` would be
+  mangled; not handled, as no real Herdr path has one.
+- **Herdr tolerates a bare connect-and-close** (no log noise, next request
+  answered). Readiness still sends `agent.list` and waits for any reply,
+  because a bare connect proves nothing: ssh binds the local socket before
+  any remote connection exists and accepts connections even when nothing
+  listens at the remote path (they are dropped right after). With a probe
+  request, a missing remote socket surfaces after 10 s as "No Herdr is
+  listening at … on <host>. Is Herdr running there?".
+- **Manual run** against a throwaway unprivileged sshd on `127.0.0.1:2222`
+  (own host key, `authorized_keys` and client config, reached through
+  `WL_TEST_SSH_PATH`, so `~/.ssh` was never touched) serving the local Herdr
+  socket via the default `~/.config/herdr/herdr.sock`: the live test lists
+  agents through the tunnel and passes. With `WL_TEST_REMOTE_HOLD=60`,
+  `kill -9` of the xctest process left no `ssh … cat >/dev/null`, no remote
+  `cat` and no `sshd-session` within 2 s (only the stale local socket file,
+  which the next start unlinks). Killing ssh while connected → `failed` →
+  reconnected after the 3 s backoff; an unresolvable host fails at once with
+  ssh's own message and keeps retrying; real ssh's `Host key verification
+  failed.` and `Permission denied (publickey).` match the mapped messages.
+- Foundation's `Process` does not leak the tunnel's stdin pipe into later
+  children (checked with `lsof`: a second child only holds fds 0–2), so a
+  `but` or a second ssh cannot keep the first tunnel alive after a crash.
+
+Notes (additions beyond the design):
+
+- Extra ssh options: `ConnectTimeout=10` (an unreachable host would
+  otherwise outlast the readiness window by a minute), `RemoteCommand=none`
+  (a `RemoteCommand` in the user's config makes ssh refuse ours) and
+  `ForwardAgent=no` (nothing needs the agent remotely, and a global
+  `ForwardAgent yes` would otherwise lend it to the host). The `printenv HOME` lookup shares these options and
+  `--`.
+- Local socket names that had to be sanitized or truncated get an FNV-1a
+  hash of the original name appended (`mm-a_b-1a2b3c4d.sock`), so names that
+  sanitize alike (`"a b"`, `"a/b"`) don't share a socket. A `$TMPDIR` too long
+  to leave room falls back to `/tmp`. Paths stay ≤ 100 bytes.
+- Friendly messages also for channel errors (`open failed: connect failed`
+  → "No Herdr is listening…", matched before `Permission denied` so a socket
+  permission error isn't reported as an auth failure) and for
+  `administratively prohibited` (`AllowStreamLocalForwarding`). Format:
+  `<hint> (ssh: <raw line>)`; unmapped lines are shown as `ssh: <raw>`.
+- ssh ends stderr lines with `\r\n`, which Swift treats as one `Character`;
+  lines are split on `isNewline`, never on `"\n"` (found in the manual run).
+- Readiness has two deadlines (PR #4 review): a 60 s login phase (wait for
+  ssh to bind the local socket, which it does only after authenticating) and
+  then the 10 s `agent.list` probe phase, so a slow login cannot use up the
+  probe window. Their timeouts, and an early exit with no stderr, give
+  "Timed out logging in to <host>." / "Logged in to <host>, but no Herdr
+  answered at <path>." / "ssh exited with status N.".
+- Permanent failures are not retried (PR #4 review): auth `Permission
+  denied`, `Host key verification failed` and `administratively prohibited`
+  end the run in `.failed` until `start()` is called again, so a bad key
+  can't trip fail2ban on the server. Everything else keeps the backoff.
+- The `printenv HOME` answer is the last stdout line starting with `/`, so
+  login-shell startup files that echo a banner don't break the lookup
+  (PR #4 review).
+- Internal seams for tests: `init(remote:sshPath:)` (a shell script stands in
+  for ssh in `SSHTunnelTests`, covering the state machine, stderr capture,
+  `~` expansion end to end, and that `stop()` closes the stdin pipe) and
+  `retryDelay`, `loginTimeout`, `readinessTimeout`. The live test also reads `WL_TEST_SSH_PATH`,
+  `WL_TEST_REMOTE_SOCKET` and `WL_TEST_REMOTE_HOLD` (see its doc comment).
+- `deinit` terminates ssh as a safety net but does not unlink the socket:
+  two tunnels to the same remote share the path, so an old tunnel must not
+  remove the new one's socket. Phase 3 should stop the old tunnel before
+  starting the new one.
 
 ## Phase 3 — Bridge target switching
 
