@@ -8,8 +8,12 @@ when you press the key.
 It is the bridge itself — no Node, no daemon, nothing to install on the Herdr
 side. It reads Herdr's socket directly and drives the pad over raw HID.
 
-**[Download the latest release](https://github.com/schacon/micro-manager/releases/latest/download/MicroManager.zip)**
-· [website](https://schacon.github.io/micro-manager/)
+The Herdr does not have to be on your Mac: list a few SSH hosts in the config
+and switch the pad between this Mac and any of them from the menu bar — see
+[A Herdr on another machine](#a-herdr-on-another-machine).
+
+**[Download the latest release](https://github.com/timwata/micro-manager/releases/latest/download/MicroManager.zip)**
+· [website](https://timwata.github.io/micro-manager/)
 · [hacking guide](docs/hacking.md)
 
 ---
@@ -170,42 +174,7 @@ to read it from.
 **Edit Config…** in the panel opens the file, creating an empty one first if
 there is none.
 
-### A Herdr on another machine
-
-The pad can mirror a Herdr running somewhere else, reached over SSH. List the
-hosts under `remotes`:
-
-```json
-{
-  "remotes": [
-    { "name": "workbox", "host": "workbox" },
-    { "name": "gpu", "host": "me@gpu-box", "socket": "/run/user/1000/herdr.sock" }
-  ]
-}
-```
-
-and pick one from the **Herdr** menu at the top of the panel; **This Mac** goes
-back. The choice survives a relaunch. One server at a time — the pad never
-mixes agents from two.
-
-- `name` is the label in the menu; `host` is anything `ssh` accepts as a
-  destination, so aliases, `ProxyJump` and identities from `~/.ssh/config` all
-  apply. `socket` is the Herdr socket on that machine, default
-  `~/.config/herdr/herdr.sock` (`~` is the remote home).
-- The app runs the system `ssh` in **batch mode**: there is no terminal to type
-  a password or accept a host key into. Log in with a key or an agent, and run
-  `ssh <host>` once in a terminal first to trust the host key. A rejected key or
-  an unknown host key is shown in the panel and not retried — fix it and press
-  **Retry**. Network trouble is retried by itself.
-- The tunnel is a dedicated ssh process (`ControlMaster` is turned off for it),
-  tied to the app: quitting stops it, and even a crash ends it on its own.
-- **Stack** and **Land** are off for a remote Herdr — they run `but` on this
-  Mac, and the agent's directory is on the other one. Everything else works,
-  and agent keys raise the local terminal you run the ssh session in.
-- The icon turns grey while the link is down, so an empty pad never passes
-  for "no agents".
-
-Config edits show up the next time the panel opens.
+A few environment variables override the defaults:
 
 | variable | what it overrides |
 |---|---|
@@ -213,6 +182,79 @@ Config edits show up the next time the panel opens.
 | `WL_BUT_PATH` | the GitButler binary, skipping the search |
 | `HERDR_SOCKET_PATH` | the Herdr socket — wins over the **Herdr** menu, which is then disabled |
 | `WL_SIGN_IDENTITY` | the signing identity `bundle.sh` uses |
+
+## A Herdr on another machine
+
+The pad can mirror a Herdr running on another machine — a workstation, a GPU
+box, a cloud VM — reached over SSH. Nothing is installed there: the app opens
+an SSH tunnel to the remote Herdr socket and talks to it exactly as it talks to
+the local one. One server at a time; the pad never mixes agents from two.
+
+### Setting it up
+
+1. **Make sure `ssh <host>` logs in without a prompt.** The app runs the system
+   `ssh` in batch mode, with no terminal to type a password or accept a host
+   key into. Use a key or an agent (the macOS agent, 1Password, or whatever
+   `~/.ssh/config` points at), and run `ssh <host>` once in a terminal to
+   trust the host key.
+2. **List the host under `remotes`** in `~/.config/micromanager/config.json`
+   (**Edit Config…** in the panel opens it):
+
+   ```json
+   {
+     "remotes": [
+       { "name": "workbox", "host": "workbox" },
+       { "name": "gpu", "host": "me@gpu-box", "socket": "/run/user/1000/herdr.sock" }
+     ]
+   }
+   ```
+
+   | field | |
+   |---|---|
+   | `name` | the label in the menu; must be unique |
+   | `host` | anything `ssh` accepts as a destination — aliases, `ProxyJump` and identities from `~/.ssh/config` all apply |
+   | `socket` | optional; the Herdr socket on that machine, default `~/.config/herdr/herdr.sock` (`~` is the remote home) |
+
+3. **Pick it from the Herdr menu** at the top of the panel. The line under the
+   menu says *Connecting…*, then *Connected via SSH*, and the keys light with
+   that machine's agents. **This Mac** goes back. The choice survives a
+   relaunch.
+
+Config edits show up the next time the panel opens — no relaunch needed.
+
+### What changes on a remote
+
+- **Stack** and **Land** are dark and do nothing: they run `but` on this Mac,
+  and the agent's working directory is on the other one.
+- Everything else works — agent lights and focus, tab cycling, macros, the
+  dial, the joystick and the voice key. Agent keys raise the local terminal you
+  run the ssh session in.
+- The menu-bar icon turns grey while the link is down, so an empty pad never
+  passes for "no agents", and its tooltip says which host it mirrors.
+- The tunnel is a dedicated `ssh` process owned by the app (connection sharing
+  via `ControlMaster` is turned off for it). Quitting stops it, and even a
+  crash ends it on its own, so no stray ssh is left behind.
+
+### When it does not connect
+
+The error appears in red under the menu. Network trouble and a Herdr that is
+not running yet are retried by themselves (3 s, backing off to 30 s). A
+rejected key, an unknown host key or a server that forbids forwarding is **not**
+retried — repeated failed logins can get your IP banned — so fix it and press
+**Retry**.
+
+| message | what to do |
+|---|---|
+| Run `ssh <host>` once in a terminal to trust the host key. | do that, then **Retry** |
+| SSH key auth failed (no password prompts from a menu-bar app). | set up key or agent auth for that host |
+| No Herdr is listening at … on `<host>`. Is Herdr running there? | start Herdr there, or fix `socket` |
+| `<host>` does not allow forwarding Unix sockets … | enable `AllowStreamLocalForwarding` in that server's `sshd_config` |
+| Timed out logging in to `<host>`. | check the network, VPN or `ProxyJump` |
+
+If `HERDR_SOCKET_PATH` is set, it wins: the Herdr menu is disabled and says
+so. Herdr sets that variable in every pane it runs, so an app started from
+inside a Herdr pane (`swift run` during development) gets the disabled menu —
+start it with `env -u HERDR_SOCKET_PATH` to use the picker.
 
 ## Why it must be bundled and signed
 
@@ -260,6 +302,7 @@ swift run WLInspector  # the debug UI
 | `Sources/WLMicroManager` | the menu-bar app and its panels |
 | `Sources/WLInspector` | the debug UI |
 | `docs/hacking.md` | how the pad protocol works, and how to drive it yourself |
+| `design/` | design notes and task logs for larger features (remote Herdr) |
 | `docs/index.html` | the website, served by GitHub Pages from `docs/` |
 
 The device protocol — raw-HID JSON-RPC, per-key colour, key and joystick events,

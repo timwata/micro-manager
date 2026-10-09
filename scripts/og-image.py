@@ -26,7 +26,7 @@ PITCH = "Your coding agents, lit up on your keyboard."
 SUB = ("Each Herdr agent gets its own key on a Work Louder Creator Micro 2 — "
        "red when it needs you, amber while it works. Press the key, jump to "
        "the agent.")
-URL = "schacon.github.io/micro-manager"
+URL = "timwata.github.io/micro-manager"
 
 CARD = """<!doctype html>
 <html><head><meta charset="utf-8"><style>
