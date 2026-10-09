@@ -311,7 +311,8 @@ accessibility access) showed that the app's `.task`, which holds all the
 wiring including the launch `setTarget` and auto-start, runs only once the
 menu-bar panel is first opened, on `main` too: a fresh launch opens no Herdr
 socket and no ssh until then. Not changed here (pre-existing, affects local
-mode equally).
+mode equally). Fixed later by Phase 1 of `design/review-fixes.md` (H1): the
+wiring and bootstrap now run from `AppDelegate` at launch.
 
 ## Done
 
