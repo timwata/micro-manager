@@ -1,6 +1,6 @@
 # Fix plan: code review of `main` (2026-10-09)
 
-Status: in progress. Phases 1–3 implemented.
+Status: in progress. Phases 1–4 implemented.
 
 Source: a whole-repo review of `main` at `c72fefe`. Build and tests were green
 at that commit (169 tests, 0 failures, 11 skipped). Each finding below has an
@@ -620,13 +620,42 @@ Notes:
 
 Branch `fix/review-4-tune-order` · PR title `fix: send dial and joystick commands in order`
 
-- [ ] `WLKit/SerialTaskQueue.swift` plus `SerialTaskQueueTests` (order, no
+- [x] `WLKit/SerialTaskQueue.swift` plus `SerialTaskQueueTests` (order, no
       overlap).
-- [ ] `TuneController.handleDial` and `handleJoystick` enqueue on one shared
+- [x] `TuneController.handleDial` and `handleJoystick` enqueue on one shared
       queue.
-- [ ] L6: `TuneController.resetForTargetChange()`, called from
+- [x] L6: `TuneController.resetForTargetChange()`, called from
       `onTargetChange` in `AppDelegate`.
-- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+- [x] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+Notes:
+
+- `SerialTaskQueue.enqueue` returns the item's `Task` (`@discardableResult`),
+  so the tests can await the last item instead of sleeping. The queue keeps
+  only the tail; each item awaits its predecessor, and a finished task has
+  already released what it captured, so the chain does not grow.
+- `SerialTaskQueueTests` has two tests: six items with mixed sleeps, the
+  longest first, finish in enqueue order with at most one in flight, and the
+  queue keeps ordering after it has drained. Checked that both fail with the
+  chaining removed (items finish out of order, six in flight at once).
+- `CLAUDE.md`'s WLKit list now names `SerialTaskQueue`.
+- **L6 addition:** `resetForTargetChange()` also bumps a `generation`. An
+  item already past `focusedPane()` when the target changes (its reply
+  landed just before the switch, the continuation runs after the reset)
+  would otherwise write its index under the old server's pane id, or reopen
+  the model panel. `dial` and `joystick` check the generation right after
+  `focusedPane()`, and the Codex picker path checks it again after its send,
+  since it writes the picker state only then. The Claude paths write their
+  index before sending, with no `await` in between, so one check covers
+  them. `onTargetChange` runs before `teardownHerdr()` with no `await`
+  between, so no queued item can start in that gap.
+- The Codex steering branch was restructured to send its key first and then
+  update state, so the generation check sits in one place; the keys sent and
+  the state changes per direction are the same as before.
+- Not checked here (no pad, no Accessibility grant): fast dial turns and
+  joystick deflections against a live Claude / Codex pane, and the model
+  panel closing on a target switch. These are listed as user checks in the
+  PR.
 
 ### Phase 5 — `but` output handling (M4, L8)
 

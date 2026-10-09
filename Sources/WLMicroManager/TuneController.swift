@@ -39,14 +39,43 @@ final class TuneController {
     private var codexPickerOpened: Date?
     private static let pickerLifetime: TimeInterval = 30
 
+    /// Dial and joystick share one queue. A slash command is two requests —
+    /// the text, then enter — so two in flight could type
+    /// `/effort high/effort xhigh` into one line and leave a stray enter. One
+    /// queue for both keeps a dial turn and a deflection to the same pane in
+    /// the order they were made. Detents are not coalesced: each is one step
+    /// on the ladder, and the index bookkeeping counts on that.
+    private let queue = SerialTaskQueue()
+
+    /// Bumped by `resetForTargetChange()`. Work that was already waiting on
+    /// the old server when the target changed checks it once it has the
+    /// focused pane, and again before any state it writes after a send, so it
+    /// neither writes state keyed by an old pane id nor carries on.
+    private var generation = 0
+
+    /// Pane ids are only unique per Herdr server, so on a target change all
+    /// per-pane state is dropped: otherwise a pane on the new server could
+    /// pick up another pane's ladder position, or steer a picker that was
+    /// opened somewhere else. The model list goes too; it describes a pane
+    /// the pad no longer shows.
+    func resetForTargetChange() {
+        generation += 1
+        claudeEffortIndex = [:]
+        claudeModelIndex = [:]
+        codexPickerPane = nil
+        codexPickerOpened = nil
+        TunePanelController.shared.hide()
+    }
+
     // MARK: - Dial: effort
 
     func handleDial(_ step: Int) {
-        Task { await dial(step) }
+        queue.enqueue { [self] in await dial(step) }
     }
 
     private func dial(_ step: Int) async {
-        guard let (agent, pane) = await focusedPane() else { return }
+        let generation = generation
+        guard let (agent, pane) = await focusedPane(), generation == self.generation else { return }
         let kind = agent.agent.lowercased()
         do {
             if kind.contains("claude") {
@@ -77,17 +106,18 @@ final class TuneController {
     // MARK: - Joystick: model
 
     func handleJoystick(_ direction: Pad.JoystickDirection) {
-        Task { await joystick(direction) }
+        queue.enqueue { [self] in await joystick(direction) }
     }
 
     private func joystick(_ direction: Pad.JoystickDirection) async {
-        guard let (agent, pane) = await focusedPane() else { return }
+        let generation = generation
+        guard let (agent, pane) = await focusedPane(), generation == self.generation else { return }
         let kind = agent.agent.lowercased()
         do {
             if kind.contains("claude") {
                 try await claudeModel(direction, pane: pane, agent: agent.shortName)
             } else if kind.contains("codex") {
-                try await codexModel(direction, pane: pane, agent: agent.shortName)
+                try await codexModel(direction, pane: pane, agent: agent.shortName, generation: generation)
             } else {
                 onError?("No model control for \(agent.agent).")
             }
@@ -126,7 +156,8 @@ final class TuneController {
     private func codexModel(
         _ direction: Pad.JoystickDirection,
         pane: String,
-        agent: String
+        agent: String,
+        generation: Int
     ) async throws {
         let pickerOpen = codexPickerPane == pane
             && Date().timeIntervalSince(codexPickerOpened ?? .distantPast) < Self.pickerLifetime
@@ -135,25 +166,30 @@ final class TuneController {
             // Any vertical deflection opens the picker; the rest is steering.
             guard direction == .north || direction == .south else { return }
             try await send(command: "/model", to: pane)
+            // The picker state is written after the send; a target change in
+            // between already dropped it, and `pane` belongs to the old server.
+            guard generation == self.generation else { return }
             codexPickerPane = pane
             codexPickerOpened = Date()
             showCodexModels(agent: agent)
             return
         }
 
+        let key: String
         switch direction {
-        case .north:
-            try await HerdrClient.sendKeys(paneID: pane, keys: ["up"])
+        case .north: key = "up"
+        case .south: key = "down"
+        case .east: key = "enter"
+        case .west: key = "esc"
+        }
+        try await HerdrClient.sendKeys(paneID: pane, keys: [key])
+        // Same as above: after a target change the panel stays hidden.
+        guard generation == self.generation else { return }
+
+        switch direction {
+        case .north, .south:
             showCodexModels(agent: agent)
-        case .south:
-            try await HerdrClient.sendKeys(paneID: pane, keys: ["down"])
-            showCodexModels(agent: agent)
-        case .east:
-            try await HerdrClient.sendKeys(paneID: pane, keys: ["enter"])
-            codexPickerPane = nil
-            TunePanelController.shared.hide()
-        case .west:
-            try await HerdrClient.sendKeys(paneID: pane, keys: ["esc"])
+        case .east, .west:
             codexPickerPane = nil
             TunePanelController.shared.hide()
         }
