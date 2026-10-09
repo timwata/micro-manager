@@ -1,7 +1,8 @@
 # Fix plan: code review of `main` (2026-10-09)
 
 Status: implemented (PRs #9–#14; the plan itself is #8). The one leak left
-under "Found during implementation" is planned in `design/followup-fixes.md`.
+under "Found during implementation" is fixed by Phase 1 of
+`design/followup-fixes.md`.
 
 Source: a whole-repo review of `main` at `c72fefe`. Build and tests were green
 at that commit (169 tests, 0 failures, 11 skipped). Each finding below has an
@@ -820,6 +821,8 @@ current PR.)
   dispatch queue), one per request. The fd itself is closed. The poll alone
   makes a request every 2.5 s, so the app grows by roughly 90 MB a day.
   Likely fix: have the read loop drop `onLine`/`onClosed` when it exits, or
-  capture `conn` weakly in `finish`. **Not fixed by this plan.** Planned as
-  F1 in `design/followup-fixes.md`, which also rules out the weak capture
-  (nothing else would retain `conn`) and covers the `open()` failure path.
+  capture `conn` weakly in `finish`. **Not fixed by this plan.** Fixed as
+  F1 in Phase 1 of `design/followup-fixes.md`: `SocketConnection` drops its
+  callbacks when its read loop ends and when `open()` fails. That plan rules
+  out the weak capture (nothing else would retain `conn`) and covers the
+  `open()` failure path too.
