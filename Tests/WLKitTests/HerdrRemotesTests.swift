@@ -62,6 +62,33 @@ final class HerdrRemotesTests: XCTestCase {
         XCTAssertEqual(remotes.map(\.host), ["first", "other"])
     }
 
+    /// Stray spaces would otherwise reach ssh as part of the hostname or
+    /// socket path, and make `"box "` a second, look-alike `"box"`.
+    func testValuesAreTrimmed() {
+        let remotes = parse(#"""
+        {"remotes": [
+          {"name": " box ", "host": " workbox\n", "socket": " /run/user/1000/herdr.sock "},
+          {"name": "box", "host": "second"}
+        ]}
+        """#)
+        XCTAssertEqual(remotes, [
+            HerdrRemote(name: "box", host: "workbox", socket: "/run/user/1000/herdr.sock"),
+        ])
+    }
+
+    /// ssh would read a leading `-` as an option — `-oProxyCommand=…` runs a
+    /// command — so such a host is never a destination.
+    func testHostsStartingWithADashAreSkipped() {
+        let remotes = parse(#"""
+        {"remotes": [
+          {"name": "evil", "host": "-oProxyCommand=sh -c id"},
+          {"name": "typo", "host": " -workbox"},
+          {"name": "ok", "host": "me@ok-box"}
+        ]}
+        """#)
+        XCTAssertEqual(remotes, [HerdrRemote(name: "ok", host: "me@ok-box")])
+    }
+
     func testMalformedFileYieldsNoRemotes() {
         XCTAssertEqual(parse("not json"), [])
         XCTAssertEqual(parse(#"["remotes"]"#), [])

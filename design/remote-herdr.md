@@ -132,8 +132,12 @@ Implement the storage like the existing `Counter` (`final class … :
 @unchecked Sendable` with an `NSLock`). Rationale for a global instead of an
 injected client instance: only one target exists at a time, and it avoids
 threading a client through `TuneController`/panels. Requests already in flight
-during a switch may fail against the old path — acceptable; the bridge's
-Herdr side is torn down before the path changes.
+during a switch keep their old connection; each request captures the override's
+generation (bumped on every actual change) and turns any reply that arrives
+after a switch into `HerdrError.targetChanged`, so the old target's agents are
+never applied to the new one. Event streams resolve the path in `start()`, not
+`init`. A blank path (`setSocketPath`, the env var, the override) counts as
+unset.
 
 ## 4. SSH tunnel (WLKit, new file `Sources/WLKit/SSHTunnel.swift`)
 
@@ -149,7 +153,7 @@ Launch `/usr/bin/ssh` by absolute path (launchd apps have a minimal `PATH`):
   -o StreamLocalBindUnlink=yes
   -o ControlMaster=no -o ControlPath=none
   -L <localSocket>:<remoteSocket>
-  <host>
+  -- <host>
   cat >/dev/null
 ```
 
@@ -163,6 +167,9 @@ Why each option matters:
   leaving a useless connection.
 - `StreamLocalBindUnlink=yes` — removes a stale local socket file from a
   previous run before binding.
+- `--` before the host — `parse()` already drops hosts starting with `-`,
+  but the argument list must not depend on that: ssh would read such a host
+  as an option (`-oProxyCommand=…`).
 - `ControlMaster=no`, `ControlPath=none` — if the user's config multiplexes,
   the forward would be registered on the master and the process lifetime
   would no longer equal the tunnel lifetime. Own a dedicated connection.

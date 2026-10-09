@@ -11,8 +11,10 @@ import Foundation
 ///       ]
 ///     }
 ///
-/// `host` is handed to the system `ssh` untouched, so anything it accepts as a
-/// destination works — `~/.ssh/config` aliases, `ProxyJump`, identities.
+/// `host` is handed to the system `ssh` as given (trimmed), so anything it
+/// accepts as a destination works — `~/.ssh/config` aliases, `ProxyJump`,
+/// identities. The one exception is a leading `-`, which ssh would read as
+/// an option (`-oProxyCommand=…` runs a command), so such entries are dropped.
 public struct HerdrRemote: Equatable, Sendable, Identifiable {
     /// Label in the picker, and the key the selection is persisted under —
     /// hence unique.
@@ -71,6 +73,7 @@ public enum HerdrRemotes {
             guard let object = entry as? [String: Any],
                   let name = nonEmpty(object["name"]),
                   let host = nonEmpty(object["host"]),
+                  !host.hasPrefix("-"),
                   // Names key the persisted selection, so a duplicate would be
                   // unreachable anyway; the first one wins, as in a dictionary
                   // literal read top to bottom.
@@ -81,12 +84,13 @@ public enum HerdrRemotes {
         return remotes
     }
 
-    /// Whitespace-only counts as empty: `" "` is never a usable name, host or
-    /// path, and a picker entry that renders as blank is worse than none.
+    /// The value trimmed, or nil if nothing is left: `" "` is never a usable
+    /// name, host or path, and a picker entry that renders as blank is worse
+    /// than none. Trimming also keeps `"box "` from counting as a second
+    /// `"box"` and a stray space from reaching ssh as part of a hostname.
     private static func nonEmpty(_ value: Any?) -> String? {
-        guard let string = value as? String,
-              !string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return nil }
-        return string
+        guard let string = value as? String else { return nil }
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

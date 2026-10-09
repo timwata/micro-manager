@@ -46,9 +46,17 @@ Notes (small additions beyond the design, no deviation in behaviour):
 
 - `HerdrRemote` also has a memberwise `public init` and `remoteSocket`
   (`socket ?? defaultSocket`) for Phase 2 to forward to.
-- "Non-empty" means not blank after trimming whitespace; an empty `socket`
-  is treated as absent (default path).
-- `setSocketPath("")` clears the override like `nil`.
+- "Non-empty" means not blank after trimming whitespace, and the trimmed
+  value is what is kept (so `"box "` and `"box"` are duplicates); an empty
+  `socket` is treated as absent (default path).
+- A `host` starting with `-` is skipped: ssh would read it as an option.
+- A blank `setSocketPath`, override or `HERDR_SOCKET_PATH` counts as unset,
+  in both `setSocketPath` and `resolveSocketPath`.
+- `setSocketPath` bumps a generation counter on every actual change;
+  `HerdrClient.request` turns a reply that arrives after a switch into
+  `HerdrError.targetChanged` instead of delivering the old target's data.
+  Tested against a fake socket server.
+- `HerdrEventStream` resolves the socket path in `start()`, not `init`.
 - The precedence lives in an internal pure
   `resolveSocketPath(environment:override:)`, so the env-wins case is tested
   without touching the process environment
@@ -62,7 +70,8 @@ Branch `feat/remote-herdr-2-tunnel` · PR title `feat: ssh tunnel to a remote he
 
 - [ ] Add `Sources/WLKit/SSHTunnel.swift` (§4).
   - [ ] Pure `arguments(host:localSocket:remoteSocket:)` with every option in
-        §4.1, ending in `<host> cat >/dev/null`.
+        §4.1, ending in `-- <host> cat >/dev/null` (the `--` keeps a host
+        starting with `-` from being read as an option).
   - [ ] Pure local socket path builder (`$TMPDIR/mm-<sanitized>.sock`,
         < 104 bytes) (§4.2).
   - [ ] Remote `~/` expansion via `ssh … printenv HOME`, cached per host, 10 s

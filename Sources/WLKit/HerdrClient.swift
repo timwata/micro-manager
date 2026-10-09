@@ -105,6 +105,8 @@ public enum HerdrError: LocalizedError {
     case timeout(String)
     case api(String)
     case closed(String)
+    /// The reply came from a target the app has since switched away from.
+    case targetChanged(String)
     case badResponse(String)
 
     public var errorDescription: String? {
@@ -114,6 +116,8 @@ public enum HerdrError: LocalizedError {
         case .timeout(let method): return "Timed out waiting for \(method)."
         case .api(let message): return message
         case .closed(let method): return "Connection closed before \(method) responded."
+        case .targetChanged(let method):
+            return "The Herdr target changed before \(method) responded."
         case .badResponse(let detail): return "Bad response: \(detail)"
         }
     }
@@ -132,48 +136,85 @@ public enum HerdrClient {
     ///    to a remote Herdr.
     /// 3. Herdr's own default under `$XDG_CONFIG_HOME` or `~/.config`.
     public static func socketPath() -> String {
-        resolveSocketPath(
-            environment: ProcessInfo.processInfo.environment,
-            override: socketOverride.value
-        )
+        currentTarget().path
     }
 
-    /// Points every Herdr call at another socket; nil restores the local
-    /// default. A process-wide setting rather than an injected client because
-    /// only one target exists at a time, and threading a client through the
-    /// tune controller and panels would buy nothing. Requests already in
-    /// flight keep their old connection and may fail — the bridge tears its
-    /// Herdr side down before switching, so nothing long-lived is stranded.
+    /// Points every Herdr call at another socket; nil (or a blank path)
+    /// restores the local default. A process-wide setting rather than an
+    /// injected client because only one target exists at a time, and
+    /// threading a client through the tune controller and panels would buy
+    /// nothing. Requests already in flight keep their old connection; any
+    /// reply they get after the switch is turned into `.targetChanged`
+    /// rather than delivered, so the old target's agents can never be read
+    /// as the new one's.
     public static func setSocketPath(_ path: String?) {
-        socketOverride.value = path.flatMap { $0.isEmpty ? nil : $0 }
+        socketOverride.set(nonBlank(path))
     }
 
-    /// `HERDR_SOCKET_PATH`, if set and non-empty. While it is, `setSocketPath`
+    /// `HERDR_SOCKET_PATH`, if set and not blank. While it is, `setSocketPath`
     /// has no effect, so the app should not offer a target choice at all.
     public static var environmentOverride: String? {
-        ProcessInfo.processInfo.environment["HERDR_SOCKET_PATH"].flatMap { $0.isEmpty ? nil : $0 }
+        nonBlank(ProcessInfo.processInfo.environment["HERDR_SOCKET_PATH"])
     }
 
     /// The precedence of `socketPath()` with its inputs passed in, so it can
     /// be tested without touching the process environment.
     static func resolveSocketPath(environment env: [String: String], override: String?) -> String {
-        if let explicit = env["HERDR_SOCKET_PATH"], !explicit.isEmpty { return explicit }
-        if let override { return override }
-        let base = env["XDG_CONFIG_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+        if let explicit = nonBlank(env["HERDR_SOCKET_PATH"]) { return explicit }
+        if let override = nonBlank(override) { return override }
+        let base = nonBlank(env["XDG_CONFIG_HOME"])
             ?? (NSHomeDirectory() as NSString).appendingPathComponent(".config")
         return (base as NSString).appendingPathComponent("herdr/herdr.sock")
     }
 
-    private static let socketOverride = LockedPath()
+    /// Trimmed, with nothing left meaning unset — the same rule
+    /// `HerdrRemotes.parse` applies. A blank path could only ever fail to
+    /// connect, so it falls through to the next level instead.
+    private static func nonBlank(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed
+    }
+
+    /// The socket to connect to plus the generation it belongs to, read
+    /// under one lock so a request can later tell whether it is stale.
+    private static func currentTarget() -> (path: String, generation: Int) {
+        let (override, generation) = socketOverride.snapshot()
+        let path = resolveSocketPath(
+            environment: ProcessInfo.processInfo.environment,
+            override: override
+        )
+        return (path, generation)
+    }
+
+    private static let socketOverride = SocketOverride()
 
     /// Written from the main actor on a target switch, read from whichever
-    /// thread opens a connection.
-    private final class LockedPath: @unchecked Sendable {
+    /// thread opens a connection. The generation moves on every actual
+    /// change, so a reply can be matched to the target it was asked of.
+    private final class SocketOverride: @unchecked Sendable {
         private var path: String?
+        private var generation = 0
         private let lock = NSLock()
-        var value: String? {
-            get { lock.lock(); defer { lock.unlock() }; return path }
-            set { lock.lock(); defer { lock.unlock() }; path = newValue }
+
+        func snapshot() -> (path: String?, generation: Int) {
+            lock.lock(); defer { lock.unlock() }
+            return (path, generation)
+        }
+
+        var currentGeneration: Int {
+            lock.lock(); defer { lock.unlock() }
+            return generation
+        }
+
+        /// Setting the same path again is not a switch, so requests in
+        /// flight against it stay valid.
+        func set(_ newPath: String?) {
+            lock.lock(); defer { lock.unlock() }
+            guard newPath != path else { return }
+            path = newPath
+            generation += 1
         }
     }
 
@@ -185,12 +226,19 @@ public enum HerdrClient {
         timeout: TimeInterval = 5
     ) async throws -> [String: Any] {
         try await withCheckedThrowingContinuation { continuation in
-            let conn = SocketConnection(path: socketPath())
+            let target = currentTarget()
+            let conn = SocketConnection(path: target.path)
             var finished = false
             let finish: (Result<[String: Any], Error>) -> Void = { result in
                 guard !finished else { return }
                 finished = true
                 conn.close()
+                // Whatever the old target said — agents, focus, an error — is
+                // about a server the caller no longer mirrors.
+                guard socketOverride.currentGeneration == target.generation else {
+                    continuation.resume(throwing: HerdrError.targetChanged(method))
+                    return
+                }
                 continuation.resume(with: result)
             }
 
@@ -322,17 +370,21 @@ public final class HerdrEventStream {
     public var onClosed: ((Error?) -> Void)?
 
     private let subscriptions: [[String: Any]]
-    private let conn: SocketConnection
+    /// Created in `start()`, not `init`, so a stream built before a target
+    /// switch and started after it subscribes to the new target.
+    private var conn: SocketConnection?
     private var ready = false
     private var stopped = false
 
     public init(subscriptions: [[String: Any]]) {
         self.subscriptions = subscriptions
-        self.conn = SocketConnection(path: HerdrClient.socketPath())
     }
 
     @discardableResult
     public func start() -> HerdrEventStream {
+        guard conn == nil, !stopped else { return self }
+        let conn = SocketConnection(path: HerdrClient.socketPath())
+        self.conn = conn
         conn.onLine = { [weak self] line in
             guard let self, !self.stopped else { return }
             guard let data = line.data(using: .utf8),
@@ -370,10 +422,10 @@ public final class HerdrEventStream {
 
     public func stop() {
         stopped = true
-        conn.close()
+        conn?.close()
     }
 
-    deinit { conn.close() }
+    deinit { conn?.close() }
 }
 
 // MARK: - Socket plumbing
