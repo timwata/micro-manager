@@ -43,6 +43,24 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var landPanelOpen = false
     /// Whether a Claude voice take is open, for the voice key's light.
     @Published public private(set) var voiceActive = false
+    /// Which Herdr server the pad mirrors. Changed only through `setTarget`.
+    @Published public private(set) var target: HerdrTarget = .local
+    /// How far the connection to a remote target has got. While a tunnel is
+    /// down this — not `lastError` — is what explains an empty pad.
+    @Published public private(set) var link: LinkState = .local
+
+    public enum LinkState: Equatable, Sendable {
+        /// No tunnel in play: the target is this Mac, or the bridge is off.
+        case local
+        case connecting
+        case connected
+        /// A message meant for a person, straight from `SSHTunnel`.
+        case failed(String)
+    }
+
+    public var isRemote: Bool {
+        if case .remote = target { return true } else { return false }
+    }
 
     public var config: BridgeConfig
     /// Text macros for the spare keys, reloaded on every bridge start so a
@@ -72,12 +90,36 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var emulator: PadEmulator?
     private var lifecycle: HerdrEventStream?
     private var statusStreams: [String: HerdrEventStream] = [:]
-    private var pollTask: Task<Void, Never>?
+    /// Internal so tests can check that no poll loop outlives its target.
+    private(set) var pollTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var reopenTask: Task<Void, Never>?
     private var lastFingerprint: String?
     private var issuedIDs = Set<Int>()
     private var warnedPermission = false
+    /// Owned while the target is remote and the bridge runs.
+    private var tunnel: SSHTunnel?
+    /// The ssh the tunnel runs. A seam for live tests, which reach a
+    /// throwaway sshd through a wrapper script rather than `~/.ssh/config`.
+    var sshPath = "/usr/bin/ssh"
+    /// Where `refresh()` reads agents from. A seam for tests, which hold a
+    /// read open to land a stop or a switch in the middle of it.
+    var listAgents: @MainActor () async throws -> [HerdrAgent] = { try await HerdrClient.listAgents() }
+    /// Whether the Herdr side — socket path, tunnel, streams, poll — is up
+    /// for the current target. Separate from `isRunning` because the device
+    /// opens first: until `start()` has opened it and ensured the keymap,
+    /// nothing may refresh — a refresh would paint keys that may not be bound
+    /// yet, and read whatever socket the previous target left behind.
+    private var herdrActive = false
+    /// True while `start()` is between turning on and `startHerdr()`: the
+    /// device side is still opening, and `start()` will bring up whatever the
+    /// target is by then.
+    private var openingDevice = false
+    /// Bumped on every Herdr teardown. Callbacks and replies that were set up
+    /// under an older value belong to a target the pad no longer mirrors —
+    /// a superseded tunnel's state change, a closed stream's retry, an
+    /// `agent.list` that was in flight across a switch — and are dropped.
+    private var herdrGeneration = 0
 
     public init(config: BridgeConfig = BridgeConfig()) {
         self.config = config
@@ -135,31 +177,157 @@ public final class BridgeController: ObservableObject {
         contendingClient = false
         keyBindings = KeyBindings.load()
 
+        openingDevice = true
         await openDevice()
+        openingDevice = false
+        await startHerdr()
+    }
+
+    public func stop() async {
+        isRunning = false
+        // A start() still opening the device finds isRunning false and stops
+        // there; clearing this now keeps a quick stop/start from inheriting it.
+        openingDevice = false
+        reopenTask?.cancel(); reopenTask = nil
+        teardownHerdr()
+        await teardownDevice()
+    }
+
+    /// Points the pad at another Herdr server. Takes effect at once while
+    /// running, otherwise on the next `start()`.
+    ///
+    /// Only the Herdr side is rebuilt: the device stays open, so there is no
+    /// keymap re-read and no flicker. The old target's agent lights are
+    /// cleared first, so they can never pass for the new target's.
+    public func setTarget(_ target: HerdrTarget) async {
+        guard target != self.target else { return }
+        self.target = target
+        guard isRunning else { return }
+
+        teardownHerdr()
+        // Whatever went wrong was about the server the pad just left.
+        lastError = nil
+        // start() is still opening the pad: it brings up the new target
+        // itself, and must be the first to paint, once the keymap is ensured.
+        guard !openingDevice else { return }
+        let generation = herdrGeneration
+        await render([])
+        // Another switch, or a stop, may have come in during the repaint;
+        // whichever did owns the Herdr side now.
+        guard isRunning, generation == herdrGeneration else { return }
+        await startHerdr()
+    }
+
+    /// Kills a remote target's ssh, synchronously. Meant for
+    /// `applicationWillTerminate`, where nothing async gets to finish; the
+    /// tunnel's stdin trick already covers a crash. Nothing restarts the
+    /// tunnel afterwards short of the next `start()` or `setTarget`.
+    public func shutdownTunnel() {
+        guard let tunnel else { return }
+        // Its `.idle` is our own doing, not news for `link`.
+        tunnel.onStateChange = nil
+        tunnel.stop()
+        self.tunnel = nil
+    }
+
+    // MARK: - Herdr side
+
+    /// Brings up the current target — the tunnel first if it is remote —
+    /// then the streams and the poll. Does nothing if already up, so a
+    /// `start()` and a `setTarget` that overlap bring it up once.
+    private func startHerdr() async {
+        guard isRunning, !herdrActive else { return }
+        herdrActive = true
+        let generation = herdrGeneration
+
+        switch target {
+        case .local:
+            HerdrClient.setSocketPath(nil)
+            link = .local
+        case .remote(let remote):
+            let tunnel = SSHTunnel(remote: remote, sshPath: sshPath)
+            tunnel.onStateChange = { [weak self] state in
+                guard let self, generation == self.herdrGeneration else { return }
+                self.tunnelChanged(state)
+            }
+            self.tunnel = tunnel
+            // The path is fixed per remote, so every call can be pointed at
+            // it before the forward exists. Until it does, they fail fast
+            // and the lifecycle stream and poll simply retry.
+            HerdrClient.setSocketPath(tunnel.localSocket)
+            link = .connecting
+            tunnel.start()
+        }
+
         startLifecycleStream()
         await refresh()
+        // A stop or a switch during the refresh owns the Herdr side now; a
+        // poll started here would carry its generation and never be dropped.
+        guard isRunning, generation == herdrGeneration else { return }
 
+        pollTask?.cancel()
         pollTask = Task { [weak self] in
-            guard let self else { return }
             while !Task.isCancelled {
-                let interval = self.config.pollInterval
+                guard let interval = self?.config.pollInterval else { return }
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                if Task.isCancelled { break }
+                guard let self, !Task.isCancelled, generation == self.herdrGeneration else { return }
                 await self.refresh()
             }
         }
     }
 
-    public func stop() async {
-        isRunning = false
+    /// Everything that talks to Herdr, and nothing that talks to the pad.
+    private func teardownHerdr() {
+        herdrActive = false
+        herdrGeneration += 1
         pollTask?.cancel(); pollTask = nil
         debounceTask?.cancel(); debounceTask = nil
-        reopenTask?.cancel(); reopenTask = nil
         lifecycle?.stop(); lifecycle = nil
         statusStreams.values.forEach { $0.stop() }
         statusStreams.removeAll()
+        // Stop the old tunnel before a new one can start: two tunnels to the
+        // same remote share a local socket path.
+        shutdownTunnel()
+        // Back to the local default, so the next bring-up always moves the
+        // client's generation and nothing in flight survives the switch —
+        // even when a remote was edited in place and keeps its socket path.
+        HerdrClient.setSocketPath(nil)
+        link = .local
+        agents = []
         lastFingerprint = nil
+    }
 
+    /// Mirrors the tunnel into `link`, and repaints at once rather than on
+    /// the next poll: on `.connected` to show the remote's agents, on a drop
+    /// to stop showing them as live.
+    private func tunnelChanged(_ state: SSHTunnel.State) {
+        let newLink: LinkState
+        switch state {
+        case .idle: return   // only `stop()` gets here, and that is ours
+        case .connecting: newLink = .connecting
+        case .connected: newLink = .connected
+        case .failed(let message): newLink = .failed(message)
+        }
+        guard newLink != link else { return }
+        link = newLink
+        Task { [weak self] in
+            if newLink == .connected {
+                await self?.forceRepaint()
+            } else {
+                await self?.refresh()
+            }
+        }
+    }
+
+    /// Whether Herdr calls can reach the target right now. Always assumed for
+    /// this Mac — a local failure is reported as it always was.
+    private var linkUp: Bool {
+        link == .local || link == .connected
+    }
+
+    // MARK: - Device teardown
+
+    private func teardownDevice() async {
         // Switching off clears the lights but deliberately leaves the keymap
         // alone: rebinding is a flash write, and the keys light instantly on
         // the way back in if the bindings are still there.
@@ -179,8 +347,9 @@ public final class BridgeController: ObservableObject {
     private func openDevice() async {
         // Ask for Input Monitoring explicitly. hidapi-style opens just fail
         // with a privilege violation without ever raising the prompt, which
-        // reads as a bug rather than a permission.
-        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+        // reads as a bug rather than a permission. The virtual pad needs none.
+        if device.emulator == nil,
+           IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
             _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
         }
 
@@ -260,7 +429,8 @@ public final class BridgeController: ObservableObject {
     // MARK: - Herdr events
 
     private func startLifecycleStream() {
-        guard isRunning else { return }
+        guard isRunning, herdrActive else { return }
+        let generation = herdrGeneration
         let stream = HerdrEventStream(subscriptions: [
             ["type": "pane.created"],
             ["type": "pane.closed"],
@@ -269,11 +439,14 @@ public final class BridgeController: ObservableObject {
         ])
         stream.onEvent = { [weak self] _ in self?.schedule() }
         stream.onClosed = { [weak self] _ in
-            guard let self, self.isRunning else { return }
+            // A close already queued when the stream was stopped must not
+            // drop — or restart — the stream that replaced it.
+            guard let self, self.isRunning, generation == self.herdrGeneration else { return }
             self.lifecycle = nil
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                self?.startLifecycleStream()
+                guard let self, generation == self.herdrGeneration else { return }
+                self.startLifecycleStream()
             }
         }
         lifecycle = stream.start()
@@ -287,13 +460,17 @@ public final class BridgeController: ObservableObject {
             stream.stop()
             statusStreams.removeValue(forKey: paneID)
         }
+        let generation = herdrGeneration
         for paneID in wanted where statusStreams[paneID] == nil {
             let stream = HerdrEventStream(subscriptions: [
                 ["type": "pane.agent_status_changed", "pane_id": paneID],
             ])
             stream.onEvent = { [weak self] _ in self?.schedule() }
             stream.onClosed = { [weak self] _ in
-                self?.statusStreams.removeValue(forKey: paneID)
+                // Pane ids are only unique per server: after a switch, the
+                // same id may name the new target's stream.
+                guard let self, generation == self.herdrGeneration else { return }
+                self.statusStreams.removeValue(forKey: paneID)
             }
             statusStreams[paneID] = stream.start()
         }
@@ -305,6 +482,9 @@ public final class BridgeController: ObservableObject {
             guard let self else { return }
             let delay = self.config.debounce
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            // Cancelled by a teardown, which may already have let a new
+            // debounce start; that one is not ours to clear.
+            if Task.isCancelled { return }
             self.debounceTask = nil
             await self.refresh()
         }
@@ -317,37 +497,46 @@ public final class BridgeController: ObservableObject {
         await refresh()
     }
 
+    /// Re-reads `agent.list` and paints it. While a remote link is down there
+    /// is nothing to read: the pad shows no agents, and the raw socket error
+    /// (which names a temp path nobody would recognise) is not surfaced —
+    /// `link` already says what is wrong.
     private func refresh() async {
-        guard isRunning else { return }
+        guard isRunning, herdrActive else { return }
+        let generation = herdrGeneration
 
-        let fetched: [HerdrAgent]
-        do {
-            fetched = try await HerdrClient.listAgents()
-        } catch {
-            lastError = error.localizedDescription
-            return
+        var fetched: [HerdrAgent] = []
+        if linkUp {
+            do {
+                fetched = try await listAgents()
+            } catch {
+                // A switch or a dropped link since the request went out makes
+                // the error about something the UI no longer shows.
+                guard generation == herdrGeneration, linkUp else { return }
+                lastError = error.localizedDescription
+                return
+            }
+            guard isRunning, generation == herdrGeneration else { return }
+            lastError = nil
         }
-        lastError = nil
         agents = fetched
         reconcileStatusStreams(fetched)
+        await render(fetched)
+    }
 
-        let state = StatusMapper.aggregate(fetched, config)
-        // Macro and voice keys share ids, so the binding decides each key's
-        // light: configured text wins, the wide key falls back to voice.
-        let flexKeys = (Pad.macroKeyIDs + Pad.voiceKeyIDs).map { key -> OAI.Thread in
-            if keyBindings.text(for: key) != nil {
-                return StatusMapper.macroThread(id: key, config)
-            }
-            if Pad.voiceKeyIDs.contains(key) {
-                return StatusMapper.voiceThread(id: key, active: voiceActive, config)
-            }
-            return OAI.Thread(id: key, brightness: 0, effect: .off)
-        }
-        let threads = StatusMapper.threads(for: fetched, config)
-            + [StatusMapper.stackThread(open: stackPanelOpen, config),
-               StatusMapper.tabCycleThread(config),
-               StatusMapper.landThread(open: landPanelOpen, config)]
-            + flexKeys
+    /// Paints the pad for a set of agents, skipping the device when the
+    /// picture has not changed since the last paint.
+    private func render(_ agents: [HerdrAgent]) async {
+        let state = StatusMapper.aggregate(agents, config)
+        let threads = Self.padThreads(
+            agents: agents,
+            keyBindings: keyBindings,
+            voiceActive: voiceActive,
+            stackPanelOpen: stackPanelOpen,
+            landPanelOpen: landPanelOpen,
+            isRemote: isRemote,
+            config
+        )
 
         // Fingerprint the whole rendered picture, not just the aggregate, so
         // one agent changing still repaints when the worst state has not.
@@ -361,6 +550,44 @@ public final class BridgeController: ObservableObject {
         guard fingerprint != lastFingerprint else { return }
         lastFingerprint = fingerprint
         await apply(state: state, threads: threads)
+    }
+
+    /// Every key the bridge lights, in one list: the agent keys, then the
+    /// action keys, then the macro/voice keys. Pure, so what each mode paints
+    /// can be tested without a device.
+    ///
+    /// Stack and Land run the local `but` in the agent's working directory,
+    /// which on a remote target is a path on another machine, so they go dark
+    /// there — dark reads as "unavailable", where a dim light means "ready".
+    nonisolated static func padThreads(
+        agents: [HerdrAgent],
+        keyBindings: KeyBindings,
+        voiceActive: Bool,
+        stackPanelOpen: Bool,
+        landPanelOpen: Bool,
+        isRemote: Bool,
+        _ config: BridgeConfig
+    ) -> [OAI.Thread] {
+        // Macro and voice keys share ids, so the binding decides each key's
+        // light: configured text wins, the wide key falls back to voice.
+        let flexKeys = (Pad.macroKeyIDs + Pad.voiceKeyIDs).map { key -> OAI.Thread in
+            if keyBindings.text(for: key) != nil {
+                return StatusMapper.macroThread(id: key, config)
+            }
+            if Pad.voiceKeyIDs.contains(key) {
+                return StatusMapper.voiceThread(id: key, active: voiceActive, config)
+            }
+            return OAI.Thread(id: key, brightness: 0, effect: .off)
+        }
+        let stack = isRemote
+            ? OAI.Thread(id: Pad.stackKeyID, brightness: 0, effect: .off)
+            : StatusMapper.stackThread(open: stackPanelOpen, config)
+        let land = isRemote
+            ? OAI.Thread(id: Pad.landKeyID, brightness: 0, effect: .off)
+            : StatusMapper.landThread(open: landPanelOpen, config)
+        return StatusMapper.threads(for: agents, config)
+            + [stack, StatusMapper.tabCycleThread(config), land]
+            + flexKeys
     }
 
     private func publishKeyState(_ threads: [OAI.Thread]) {
@@ -413,6 +640,12 @@ public final class BridgeController: ObservableObject {
     /// has to agree with `Pad`, so keep the dispatch in a single switch.
     public func handleKeyPress(_ index: Int) {
         if onKeyIntercept?(index) == true { return }
+        // Dark on a remote target (see `padThreads`); say why rather than
+        // letting the press vanish.
+        if isRemote, index == Pad.stackKeyID || index == Pad.landKeyID {
+            noteError("Stack and Land are not available for a remote Herdr.")
+            return
+        }
         if index == Pad.stackKeyID {
             onStackKey?()
         } else if index == Pad.tabCycleKeyID {

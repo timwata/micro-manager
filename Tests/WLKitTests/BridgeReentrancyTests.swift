@@ -1,0 +1,136 @@
+import XCTest
+@testable import WLKit
+
+/// Stops and switches that land while the bridge is suspended mid-start, on
+/// the built-in virtual pad with `agent.list` stubbed out — so, unlike the
+/// `Live*` tests, these run everywhere, CI included.
+///
+/// A real ssh is never started: the one remote used here runs `/usr/bin/false`
+/// in its place, and the bridge only ever reads agents through the stub.
+@MainActor
+final class BridgeReentrancyTests: XCTestCase {
+
+    private var bridge: BridgeController!
+    private let agent = HerdrAgent(status: "working", paneID: "reentrancy:p1")
+    private let remote = HerdrTarget.remote(HerdrRemote(name: "reentrancy", host: "mm-reentrancy.invalid"))
+
+    override func setUp() async throws {
+        try await super.setUp()
+        bridge = BridgeController()
+        bridge.sshPath = "/usr/bin/false"
+        await bridge.useEmulator(true)
+    }
+
+    override func tearDown() async throws {
+        await bridge?.stop()
+        bridge = nil
+        HerdrClient.setSocketPath(nil)
+        try await super.tearDown()
+    }
+
+    // MARK: - A teardown during startHerdr's first refresh
+
+    /// A stop while `start()` waits on its first `agent.list` must leave no
+    /// poll loop behind once that read comes back.
+    func testStopDuringFirstRefreshLeavesNoPoll() async throws {
+        let gate = Gate()
+        bridge.listAgents = { try await gate.hold() }
+
+        let starting = Task { await bridge.start() }
+        try await waitUntil("first agent.list in flight") { gate.isHolding }
+
+        await bridge.stop()
+        gate.release([agent])
+        await starting.value
+
+        XCTAssertFalse(bridge.isRunning)
+        XCTAssertNil(bridge.pollTask)
+    }
+
+    /// A switch while `start()` waits on its first `agent.list` owns the
+    /// Herdr side from then on: when the read comes back, the resumed start
+    /// must not replace the switch's poll with one of its own.
+    func testSwitchDuringFirstRefreshKeepsOnePoll() async throws {
+        let gate = Gate()
+        bridge.listAgents = { try await gate.hold() }
+
+        let starting = Task { await bridge.start() }
+        try await waitUntil("first agent.list in flight") { gate.isHolding }
+
+        await bridge.setTarget(remote)
+        let poll = try XCTUnwrap(bridge.pollTask, "the switch brings up its own poll")
+        gate.release([agent])
+        await starting.value
+
+        XCTAssertEqual(bridge.pollTask, poll)
+        XCTAssertTrue(bridge.agents.isEmpty, "the old target's late reply is dropped")
+    }
+
+    // MARK: - A switch while start() opens the device
+
+    /// A switch while `start()` is still opening the pad must not paint
+    /// before the keymap is ensured: a key that is not yet bound would take
+    /// the colour in silence and stay dark.
+    func testSwitchDuringDeviceOpenPaintsAfterTheKeymap() async throws {
+        bridge.listAgents = { [agent] in [agent] }
+        // Recorded while off; the switch back during start() is the race.
+        await bridge.setTarget(remote)
+
+        let starting = Task { await bridge.start() }
+        // isRunning is set before the first await, so this is start()
+        // suspended inside openDevice().
+        while !bridge.isRunning { await Task.yield() }
+
+        await bridge.setTarget(.local)
+        await starting.value
+
+        let pad = try XCTUnwrap(bridge.emulator)
+        let keymapWritten = try XCTUnwrap(
+            pad.traffic.firstIndex { $0.hasPrefix("fs.write keymap.json") },
+            "a stock pad gets its keymap written"
+        )
+        let firstPaint = pad.traffic.firstIndex { $0.hasPrefix(OAI.methodThreads) }
+        XCTAssertNotNil(firstPaint)
+        if let firstPaint {
+            XCTAssertGreaterThan(firstPaint, keymapWritten, "\(pad.traffic)")
+        }
+        XCTAssertEqual(bridge.link, .local)
+        XCTAssertTrue(pad.keys[Pad.agentKeyIDs[0]]?.isLit ?? false, "the agent's key lights")
+    }
+
+    // MARK: - Helpers
+
+    /// Holds every `agent.list` open until the test releases them all.
+    @MainActor
+    private final class Gate {
+        private var waiting: [CheckedContinuation<[HerdrAgent], Error>] = []
+        var isHolding: Bool { !waiting.isEmpty }
+
+        func hold() async throws -> [HerdrAgent] {
+            try await withCheckedThrowingContinuation { waiting.append($0) }
+        }
+
+        func release(_ agents: [HerdrAgent]) {
+            waiting.forEach { $0.resume(returning: agents) }
+            waiting.removeAll()
+        }
+    }
+
+    private func waitUntil(
+        _ what: String,
+        timeout: TimeInterval = 5,
+        line: UInt = #line,
+        _ condition: @escaping () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else {
+                XCTFail("timed out waiting for: \(what)", line: line)
+                throw TimedOut()
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private struct TimedOut: Error {}
+}
