@@ -208,6 +208,29 @@ final class SSHTunnelTests: XCTestCase {
         XCTAssertNil(SSHTunnel.describeFailure("  \n", host: "box", remoteSocket: nil))
     }
 
+    func testLoginAndConfigProblemsArePermanent() {
+        XCTAssertTrue(SSHTunnel.isPermanentFailure("me@box: Permission denied (publickey)."))
+        XCTAssertTrue(SSHTunnel.isPermanentFailure("Host key verification failed."))
+        XCTAssertTrue(SSHTunnel.isPermanentFailure("channel 2: open failed: administratively prohibited: open failed"))
+    }
+
+    func testNetworkAndRemoteSocketProblemsAreTransient() {
+        // A socket the remote user may not open is not a rejected login.
+        XCTAssertFalse(SSHTunnel.isPermanentFailure("channel 3: open failed: connect failed: Permission denied"))
+        XCTAssertFalse(SSHTunnel.isPermanentFailure("channel 2: open failed: connect failed: No such file or directory"))
+        XCTAssertFalse(SSHTunnel.isPermanentFailure("ssh: connect to host box port 22: Operation timed out"))
+        XCTAssertFalse(SSHTunnel.isPermanentFailure("Connection closed by 10.0.0.2 port 22"))
+        XCTAssertFalse(SSHTunnel.isPermanentFailure(nil))
+    }
+
+    func testHomeIsTheLastAbsolutePathOnStdout() {
+        XCTAssertEqual(SSHTunnel.parseHome("/home/me\n"), "/home/me")
+        XCTAssertEqual(SSHTunnel.parseHome("Welcome to workbox!\r\n  /home/me  \r\n\n"), "/home/me")
+        XCTAssertEqual(SSHTunnel.parseHome("/etc/motd says hi\nloading nvm\n/home/me\n"), "/home/me")
+        XCTAssertNil(SSHTunnel.parseHome("Welcome!\n"))
+        XCTAssertNil(SSHTunnel.parseHome(""))
+    }
+
     func testLastNonEmptyLine() {
         XCTAssertEqual(SSHTunnel.lastNonEmptyLine("one\ntwo\n\n  \n"), "two")
         XCTAssertEqual(SSHTunnel.lastNonEmptyLine("only"), "only")
@@ -273,7 +296,9 @@ final class SSHTunnelTests: XCTestCase {
         return false
     }
 
-    func testAuthFailureIsReportedThenRetriedUntilStopped() async throws {
+    /// Retrying a rejected key only racks up failed logins, which can get
+    /// this Mac banned by the server; the run ends at the first one.
+    func testAuthFailureIsReportedOnceAndNotRetried() async throws {
         let ssh = try fakeSSH("""
         echo "debug noise" >&2
         echo "me@box: Permission denied (publickey)." >&2
@@ -289,10 +314,37 @@ final class SSHTunnelTests: XCTestCase {
         tunnel.start()
         XCTAssertEqual(tunnel.state, .connecting)
         await waitFor(log, Self.isFailure)
-        XCTAssertEqual(
-            tunnel.state,
-            .failed("SSH key auth failed (no password prompts from a menu-bar app). (ssh: me@box: Permission denied (publickey).)")
+        let failed = SSHTunnel.State.failed(
+            "SSH key auth failed (no password prompts from a menu-bar app). (ssh: me@box: Permission denied (publickey).)"
         )
+        XCTAssertEqual(tunnel.state, failed)
+
+        // Several retry delays later, still exactly one attempt.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(log.states, [.connecting, failed])
+
+        // A new start() tries again, once.
+        tunnel.start()
+        await waitFor(log) { _ in log.states.filter(Self.isFailure).count == 2 }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(log.states, [.connecting, failed, .connecting, failed])
+
+        tunnel.stop()
+        XCTAssertEqual(tunnel.state, .idle)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tunnel.localSocket))
+    }
+
+    func testTransientFailureIsRetriedUntilStopped() async throws {
+        let ssh = try fakeSSH("exit 7")
+        let tunnel = SSHTunnel(
+            remote: HerdrRemote(name: "box", host: "box", socket: "/run/herdr.sock"),
+            sshPath: ssh
+        )
+        tunnel.retryDelay = { _ in 0.05 }
+        let log = observe(tunnel)
+
+        tunnel.start()
+        await waitFor(log, Self.isFailure)
 
         // The retry goes back through .connecting and fails the same way.
         let failuresSoFar = log.states.filter(Self.isFailure).count
@@ -374,18 +426,104 @@ final class SSHTunnelTests: XCTestCase {
         XCTAssertEqual(tunnel.state, .idle)
     }
 
+    /// Login shells echo from their startup files even for `printenv HOME`;
+    /// a banner ahead of the answer must not break the lookup.
+    func testShellStartupOutputBeforeTheHomeIsIgnored() async throws {
+        let record = scratch.appendingPathComponent("args").path
+        let ssh = try fakeSSH("""
+        for last; do :; done
+        if [ "$last" = "printenv HOME" ]; then
+          echo "Welcome to the fake box!"
+          echo ""
+          echo /home/fake
+          exit 0
+        fi
+        printf '%s\\n' "$@" > '\(record)'
+        echo "stop here" >&2
+        exit 1
+        """)
+        let host = "banner-\(UUID().uuidString)"
+        let tunnel = SSHTunnel(remote: HerdrRemote(name: "box", host: host), sshPath: ssh)
+        tunnel.retryDelay = { _ in 60 }
+        let log = observe(tunnel)
+        tunnel.start()
+        await waitFor(log, Self.isFailure)
+        tunnel.stop()
+
+        let args = try String(contentsOfFile: record, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertTrue(
+            args.contains("\(tunnel.localSocket):/home/fake/.config/herdr/herdr.sock"),
+            args.joined(separator: " ")
+        )
+    }
+
+    /// An unknown host key at the home lookup is as permanent as it is for
+    /// the tunnel itself.
     func testHomeLookupFailureIsAConnectionFailure() async throws {
         let ssh = try fakeSSH("""
         echo "Host key verification failed." >&2
         exit 255
         """)
         let tunnel = SSHTunnel(remote: HerdrRemote(name: "box", host: "hk-\(UUID().uuidString)"), sshPath: ssh)
-        tunnel.retryDelay = { _ in 60 }
+        tunnel.retryDelay = { _ in 0.05 }
         let log = observe(tunnel)
         tunnel.start()
         await waitFor(log, Self.isFailure)
         guard case .failed(let message) = tunnel.state else { return XCTFail("\(tunnel.state)") }
         XCTAssertTrue(message.hasPrefix("Run `ssh hk-"), message)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(log.states.count, 2, "no retry: \(log.states)")
+        tunnel.stop()
+    }
+
+    /// The local socket file of a `-L local:remote` forward, from ssh's
+    /// arguments; a fake ssh creates it to say it has "logged in".
+    private static let localSocketFromArguments = """
+        prev=
+        for arg; do
+          if [ "$prev" = "-L" ]; then local_socket="${arg%%:*}"; fi
+          prev="$arg"
+        done
+        """
+
+    /// A login slower than the probe window still gets past the login phase;
+    /// only then does the probe window start. A plain file stands in for the
+    /// socket, so the probe never succeeds and the probe-phase timeout is
+    /// what ends the attempt.
+    func testSlowLoginDoesNotUseUpTheProbeWindow() async throws {
+        let ssh = try fakeSSH("""
+        \(Self.localSocketFromArguments)
+        sleep 0.6
+        touch "$local_socket"
+        cat >/dev/null
+        """)
+        let tunnel = SSHTunnel(
+            remote: HerdrRemote(name: "box", host: "box", socket: "/run/herdr.sock"),
+            sshPath: ssh
+        )
+        tunnel.retryDelay = { _ in 60 }
+        tunnel.loginTimeout = 5
+        tunnel.readinessTimeout = 0.3
+        let log = observe(tunnel)
+        tunnel.start()
+        await waitFor(log, Self.isFailure)
+        XCTAssertEqual(tunnel.state, .failed("Logged in to box, but no Herdr answered at /run/herdr.sock."))
+        tunnel.stop()
+    }
+
+    func testLoginThatNeverFinishesTimesOutAsALoginProblem() async throws {
+        let ssh = try fakeSSH("cat >/dev/null")
+        let tunnel = SSHTunnel(
+            remote: HerdrRemote(name: "box", host: "box", socket: "/run/herdr.sock"),
+            sshPath: ssh
+        )
+        tunnel.retryDelay = { _ in 60 }
+        tunnel.loginTimeout = 0.3
+        let log = observe(tunnel)
+        tunnel.start()
+        await waitFor(log, Self.isFailure)
+        XCTAssertEqual(tunnel.state, .failed("Timed out logging in to box."))
         tunnel.stop()
     }
 

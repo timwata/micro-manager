@@ -35,6 +35,14 @@ public final class SSHTunnel {
     /// Seconds to wait before the next attempt, given how many attempts in a
     /// row have failed. A seam for tests, which cannot wait 3 s per retry.
     var retryDelay: (Int) -> TimeInterval = SSHTunnel.backoff
+    /// How long ssh gets to log in and bind the local socket. `ConnectTimeout`
+    /// and ssh's own exit already bound the network part, so this is only a
+    /// safety cap, generous enough for a slow link or a multi-hop
+    /// `ProxyJump`. A seam for tests, like `retryDelay`.
+    var loginTimeout: TimeInterval = 60
+    /// How long a Herdr gets to answer through the forward once ssh has
+    /// logged in. A seam for tests, like `retryDelay`.
+    var readinessTimeout: TimeInterval = 10
 
     private let sshPath: String
     /// Bumped whenever an attempt is superseded, so the late callbacks of a
@@ -72,6 +80,11 @@ public final class SSHTunnel {
 
     /// Brings the tunnel up and keeps it up, retrying with backoff whenever
     /// ssh exits, until `stop()`. Calling it again while running does nothing.
+    ///
+    /// A failure that retrying cannot fix — a rejected key, an unknown host
+    /// key, forwarding disabled on the server — ends the run instead: the
+    /// state stays `.failed` and nothing is retried until `start()` is called
+    /// again.
     public func start() {
         guard !active else { return }
         active = true
@@ -103,6 +116,9 @@ public final class SSHTunnel {
             let remoteSocket: String
             do {
                 remoteSocket = try await Self.resolveRemoteSocket(remote, sshPath: sshPath)
+            } catch let error as TunnelError {
+                self?.fail(attempt, message: error.message, permanent: error.permanent)
+                return
             } catch {
                 self?.fail(attempt, message: error.localizedDescription)
                 return
@@ -156,15 +172,34 @@ public final class SSHTunnel {
         waitUntilReady(attempt, remoteSocket: remoteSocket)
     }
 
-    /// The forward is only useful once a Herdr answers through it, which is a
-    /// stronger test than the local socket existing: ssh binds it before any
-    /// remote connection is tried, and accepts (then drops) connections even
-    /// when nothing listens at the remote path.
+    /// Waits in two phases, each with its own deadline, so a slow login
+    /// cannot eat into the time a Herdr gets to answer.
+    ///
+    /// 1. Login: ssh binds the local socket only once it has logged in, and
+    ///    `launch` unlinked the path beforehand, so the file appearing means
+    ///    authentication succeeded.
+    /// 2. Probe: the forward is only useful once a Herdr answers through it.
+    ///    The socket existing proves nothing about that: ssh binds it before
+    ///    any remote connection is tried, and accepts (then drops)
+    ///    connections even when nothing listens at the remote path.
     private func waitUntilReady(_ attempt: Int, remoteSocket: String) {
         let localSocket = localSocket
+        let host = remote.host
+        let loginTimeout = loginTimeout
+        let readinessTimeout = readinessTimeout
         readinessTask = Task { [weak self] in
-            let deadline = Date().addingTimeInterval(Self.readinessTimeout)
-            while Date() < deadline {
+            let loginDeadline = Date().addingTimeInterval(loginTimeout)
+            while !FileManager.default.fileExists(atPath: localSocket) {
+                guard Date() < loginDeadline else {
+                    self?.readinessTimedOut(attempt, remoteSocket: remoteSocket, fallback: "Timed out logging in to \(host).")
+                    return
+                }
+                try? await Task.sleep(nanoseconds: UInt64(Self.probeInterval * 1_000_000_000))
+                if Task.isCancelled { return }
+            }
+
+            let probeDeadline = Date().addingTimeInterval(readinessTimeout)
+            while Date() < probeDeadline {
                 if Task.isCancelled { return }
                 if await Self.probe(localSocket, timeout: Self.probeTimeout) {
                     self?.becameReady(attempt)
@@ -172,14 +207,24 @@ public final class SSHTunnel {
                 }
                 try? await Task.sleep(nanoseconds: UInt64(Self.probeInterval * 1_000_000_000))
             }
-            guard let self, !Task.isCancelled else { return }
-            let line = self.stderrTail?.lastLine
-            self.fail(
+            guard !Task.isCancelled else { return }
+            self?.readinessTimedOut(
                 attempt,
-                message: Self.describeFailure(line, host: self.remote.host, remoteSocket: remoteSocket)
-                    ?? "Timed out connecting to \(self.remote.host)."
+                remoteSocket: remoteSocket,
+                fallback: "Logged in to \(host), but no Herdr answered at \(remoteSocket)."
             )
         }
+    }
+
+    /// ssh is still running but never got as far as needed; its last stderr
+    /// line, if any, says more than the timeout does.
+    private func readinessTimedOut(_ attempt: Int, remoteSocket: String, fallback: String) {
+        let line = stderrTail?.lastLine
+        fail(
+            attempt,
+            message: Self.describeFailure(line, host: remote.host, remoteSocket: remoteSocket) ?? fallback,
+            permanent: Self.isPermanentFailure(line)
+        )
     }
 
     private func becameReady(_ attempt: Int) {
@@ -192,15 +237,23 @@ public final class SSHTunnel {
         guard active, attempt == attemptID else { return }
         let message = Self.describeFailure(lastLine, host: remote.host, remoteSocket: nil)
             ?? "ssh exited with status \(status)."
-        fail(attempt, message: message)
+        fail(attempt, message: message, permanent: Self.isPermanentFailure(lastLine))
     }
 
-    /// Ends the attempt — whatever is left of it — and schedules the next.
-    private func fail(_ attempt: Int, message: String) {
+    /// Ends the attempt — whatever is left of it — and schedules the next,
+    /// unless the failure is permanent: then the run ends, so a rejected key
+    /// is not retried forever (and fail2ban-style jails on the server don't
+    /// ban this Mac for it).
+    private func fail(_ attempt: Int, message: String, permanent: Bool = false) {
         guard active, attempt == attemptID else { return }
         attemptID += 1
         teardownProcess()
         setState(.failed(message))
+
+        if permanent {
+            active = false
+            return
+        }
 
         let delay = retryDelay(failures)
         failures += 1
@@ -228,7 +281,6 @@ public final class SSHTunnel {
 
     // MARK: - Tuning
 
-    nonisolated static let readinessTimeout: TimeInterval = 10
     nonisolated static let probeInterval: TimeInterval = 0.2
     nonisolated static let probeTimeout: TimeInterval = 2
     nonisolated static let homeLookupTimeout: TimeInterval = 10
@@ -247,7 +299,7 @@ public final class SSHTunnel {
     /// - `BatchMode=yes`: there is no terminal to type into, so a password or
     ///   host-key prompt would hang forever. Fail fast and show why instead.
     /// - `ConnectTimeout=10`: an unreachable host otherwise takes the TCP
-    ///   stack's own minute-plus to give up, far past the readiness window.
+    ///   stack's own minute-plus to give up, past the login window.
     /// - `ControlMaster=no`, `ControlPath=none`: with multiplexing configured,
     ///   the forward would be registered on a master this process does not
     ///   own, and the tunnel would outlive — or die with — someone else's ssh.
@@ -382,21 +434,37 @@ public final class SSHTunnel {
             arguments: homeLookupArguments(host: remote.host),
             timeout: homeLookupTimeout
         )
-        let home = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard output.status == 0, home.hasPrefix("/") else {
+        guard output.status == 0, let home = parseHome(output.stdout) else {
             let line = lastNonEmptyLine(output.stderr)
             throw TunnelError(
                 describeFailure(line, host: remote.host, remoteSocket: nil)
-                    ?? "Could not read the home directory on \(remote.host) (ssh exited with status \(output.status))."
+                    ?? "Could not read the home directory on \(remote.host) (ssh exited with status \(output.status)).",
+                permanent: isPermanentFailure(line)
             )
         }
         homeCache[remote.host] = home
         return expandRemoteHome(path, home: home)
     }
 
+    /// sshd still runs `printenv HOME` through the user's login shell, which
+    /// reads its startup files first (bash's `~/.bashrc` on Debian-style
+    /// builds, zsh's `~/.zshenv`, fish's `config.fish`), so anything they
+    /// echo lands on stdout ahead of the answer. The home is the last line
+    /// that is an absolute path.
+    nonisolated static func parseHome(_ stdout: String) -> String? {
+        stdout.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { $0.hasPrefix("/") }
+    }
+
     private struct TunnelError: LocalizedError {
         let message: String
-        init(_ message: String) { self.message = message }
+        /// See `isPermanentFailure`.
+        let permanent: Bool
+        init(_ message: String, permanent: Bool = false) {
+            self.message = message
+            self.permanent = permanent
+        }
         var errorDescription: String? { message }
     }
 
@@ -407,23 +475,22 @@ public final class SSHTunnel {
     /// there is nothing to say, so the caller can fall back to the exit
     /// status.
     ///
-    /// Channel errors are matched first: `open failed: connect failed:
-    /// Permission denied` is about the remote socket, not about logging in.
     nonisolated static func describeFailure(_ line: String?, host: String, remoteSocket: String?) -> String? {
         guard let line = line?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty else {
             return nil
         }
         let hint: String?
-        if line.contains("open failed: administratively prohibited") {
+        switch FailureKind(line) {
+        case .forwardingProhibited:
             hint = "\(host) does not allow forwarding Unix sockets (AllowStreamLocalForwarding in sshd_config)."
-        } else if line.contains("open failed: connect failed") {
+        case .noRemoteListener:
             let socket = remoteSocket.map { " at \($0)" } ?? ""
             hint = "No Herdr is listening\(socket) on \(host). Is Herdr running there?"
-        } else if line.contains("Host key verification failed") {
+        case .hostKey:
             hint = "Run `ssh \(host)` once in a terminal to trust the host key."
-        } else if line.contains("Permission denied") {
+        case .auth:
             hint = "SSH key auth failed (no password prompts from a menu-bar app)."
-        } else {
+        case nil:
             hint = nil
         }
         // ssh prefixes some of its own errors already ("ssh: Could not
@@ -431,6 +498,43 @@ public final class SSHTunnel {
         let raw = line.hasPrefix("ssh: ") ? line : "ssh: \(line)"
         guard let hint else { return raw }
         return "\(hint) (\(raw))"
+    }
+
+    /// Whether ssh's last stderr line reports something that retrying cannot
+    /// fix until the user changes their keys, `known_hosts` or the server's
+    /// config. Network errors, timeouts and a missing Herdr are transient.
+    nonisolated static func isPermanentFailure(_ line: String?) -> Bool {
+        guard let line else { return false }
+        return FailureKind(line)?.isPermanent ?? false
+    }
+
+    /// The ssh errors there is something specific to say about.
+    ///
+    /// Channel errors are matched first: `open failed: connect failed:
+    /// Permission denied` is about the remote socket, not about logging in.
+    private enum FailureKind {
+        case forwardingProhibited
+        case noRemoteListener
+        case hostKey
+        case auth
+
+        init?(_ line: String) {
+            if line.contains("open failed: administratively prohibited") {
+                self = .forwardingProhibited
+            } else if line.contains("open failed: connect failed") {
+                self = .noRemoteListener
+            } else if line.contains("Host key verification failed") {
+                self = .hostKey
+            } else if line.contains("Permission denied") {
+                self = .auth
+            } else {
+                return nil
+            }
+        }
+
+        /// Herdr may simply not be running yet; everything else needs the
+        /// user to step in.
+        var isPermanent: Bool { self != .noRemoteListener }
     }
 
     nonisolated static func lastNonEmptyLine(_ text: String) -> String? {

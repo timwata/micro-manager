@@ -148,12 +148,23 @@ Notes (additions beyond the design):
   `<hint> (ssh: <raw line>)`; unmapped lines are shown as `ssh: <raw>`.
 - ssh ends stderr lines with `\r\n`, which Swift treats as one `Character`;
   lines are split on `isNewline`, never on `"\n"` (found in the manual run).
-- A readiness timeout or an early exit with no stderr gives
-  "Timed out connecting to <host>." / "ssh exited with status N.".
+- Readiness has two deadlines (PR #4 review): a 60 s login phase (wait for
+  ssh to bind the local socket, which it does only after authenticating) and
+  then the 10 s `agent.list` probe phase, so a slow login cannot use up the
+  probe window. Their timeouts, and an early exit with no stderr, give
+  "Timed out logging in to <host>." / "Logged in to <host>, but no Herdr
+  answered at <path>." / "ssh exited with status N.".
+- Permanent failures are not retried (PR #4 review): auth `Permission
+  denied`, `Host key verification failed` and `administratively prohibited`
+  end the run in `.failed` until `start()` is called again, so a bad key
+  can't trip fail2ban on the server. Everything else keeps the backoff.
+- The `printenv HOME` answer is the last stdout line starting with `/`, so
+  login-shell startup files that echo a banner don't break the lookup
+  (PR #4 review).
 - Internal seams for tests: `init(remote:sshPath:)` (a shell script stands in
   for ssh in `SSHTunnelTests`, covering the state machine, stderr capture,
   `~` expansion end to end, and that `stop()` closes the stdin pipe) and
-  `retryDelay`. The live test also reads `WL_TEST_SSH_PATH`,
+  `retryDelay`, `loginTimeout`, `readinessTimeout`. The live test also reads `WL_TEST_SSH_PATH`,
   `WL_TEST_REMOTE_SOCKET` and `WL_TEST_REMOTE_HOLD` (see its doc comment).
 - `deinit` terminates ssh as a safety net but does not unlink the socket:
   two tunnels to the same remote share the path, so an old tunnel must not
