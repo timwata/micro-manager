@@ -126,6 +126,46 @@ final class BridgeReentrancyTests: XCTestCase {
         XCTAssertEqual(bridge.link, .local)
     }
 
+    // MARK: - Quitting
+
+    /// The quit hook returns before any `Task` runs, so the lights have to be
+    /// off by the time `shutdown()` returns, not on a later turn.
+    ///
+    /// Synchronous on purpose, like `applicationWillTerminate`: an async test
+    /// body runs inside a main-queue job, where the run loop `shutdown()`
+    /// spins cannot deliver the replies it waits for, so every call would sit
+    /// out its timeout instead.
+    func testShutdownDarkensThePadBeforeReturning() throws {
+        bridge.listAgents = { [agent] in [agent] }
+        Task { await bridge.start() }
+        let pad = try XCTUnwrap(bridge.emulator)
+        let deadline = Date().addingTimeInterval(5)
+        while !(pad.keys[Pad.agentKeyIDs[0]]?.isLit ?? false), Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertTrue(pad.keys[Pad.agentKeyIDs[0]]?.isLit ?? false, "the agent's key lights")
+
+        let started = Date()
+        bridge.shutdown()
+
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.5, "replies arrived; no call timed out")
+        XCTAssertFalse(bridge.isRunning)
+        XCTAssertFalse(bridge.deviceConnected)
+        XCTAssertNil(bridge.pollTask)
+        XCTAssertTrue(pad.keys.values.allSatisfy { !$0.isLit }, "\(pad.keys)")
+        XCTAssertEqual(pad.keysZone, .dark)
+        XCTAssertEqual(pad.ambientZone, .dark)
+    }
+
+    /// Switched off first, there is nothing left to darken or close.
+    func testShutdownAfterStopIsHarmless() async {
+        bridge.listAgents = { [] }
+        await bridge.start()
+        await bridge.stop()
+        bridge.shutdown()
+        XCTAssertFalse(bridge.isRunning)
+    }
+
     // MARK: - Helpers
 
     /// Holds every `agent.list` open until the test releases them all.
