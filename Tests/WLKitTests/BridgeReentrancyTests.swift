@@ -157,6 +157,49 @@ final class BridgeReentrancyTests: XCTestCase {
         XCTAssertEqual(pad.ambientZone, .dark)
     }
 
+    /// A repaint already past its guards when Quit arrives must not relight
+    /// the pad: `shutdown()` spins the run loop, which runs that repaint's
+    /// queued `callAsync` hop, and its lit `threads` call would land between
+    /// the two blanking calls. Thread state paints over zone state, so the
+    /// keys would stay lit.
+    ///
+    /// Which run-loop pass leaves the repaint waiting on that hop depends on
+    /// scheduling, so each count from 0 to 3 gets its own bridge. Synchronous
+    /// for the same reason as the test above.
+    func testShutdownWinsOverAQueuedRepaint() throws {
+        for passes in 0...3 {
+            let bridge = BridgeController()
+            bridge.sshPath = "/usr/bin/false"
+            var n = 0
+            // Alternate the status so every repaint changes the fingerprint
+            // and reaches the device.
+            bridge.listAgents = {
+                n += 1
+                return [HerdrAgent(status: n % 2 == 0 ? "working" : "blocked", paneID: "race:p1")]
+            }
+            Task { await bridge.useEmulator(true); await bridge.start() }
+            let deadline = Date().addingTimeInterval(5)
+            while !(bridge.emulator?.keys[Pad.agentKeyIDs[0]]?.isLit ?? false), Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            }
+            let pad = try XCTUnwrap(bridge.emulator)
+            XCTAssertTrue(pad.keys[Pad.agentKeyIDs[0]]?.isLit ?? false, "passes \(passes): the agent's key lights")
+
+            Task { await bridge.forceRepaint() }
+            for _ in 0..<passes { RunLoop.current.run(mode: .default, before: Date()) }
+            bridge.shutdown()
+            // Let anything left over drain.
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+
+            XCTAssertFalse(
+                pad.keys.values.contains { $0.isLit },
+                "passes \(passes): \(pad.keys.filter { $0.value.isLit }.keys.sorted())"
+            )
+            XCTAssertEqual(pad.keysZone, .dark, "passes \(passes)")
+            XCTAssertEqual(pad.ambientZone, .dark, "passes \(passes)")
+        }
+    }
+
     /// Switched off first, there is nothing left to darken or close.
     func testShutdownAfterStopIsHarmless() async {
         bridge.listAgents = { [] }

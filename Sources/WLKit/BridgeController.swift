@@ -241,8 +241,16 @@ public final class BridgeController: ObservableObject {
     /// exits as soon as that returns, so the `Task` a `stop()` would need
     /// never runs and the pad would keep showing the last agents after quit.
     ///
-    /// Each write still waits for its reply, as every other call does, so the
-    /// firmware never has two messages in flight; `replyTimeout` bounds that
+    /// The device is sealed first. Waiting on a reply spins the run loop,
+    /// which also runs main-queue work queued before the quit — a repaint's
+    /// `callAsync` hop, say — and a lit `threads` call landing between the
+    /// two blanking calls would leave the keys lit, since thread state paints
+    /// over zone state. Sealed, those calls are refused, and the blanking
+    /// calls are the last to reach the pad.
+    ///
+    /// Each blanking call waits for its reply before the next goes out, as
+    /// every other call does; a reply to an earlier repaint call may still be
+    /// outstanding when the first one is sent. `replyTimeout` bounds each
     /// wait, so a pad that stopped answering cannot hold up the quit for
     /// long. The persisted on/off setting is left alone: quitting is not
     /// switching off, and the next launch starts again.
@@ -251,7 +259,11 @@ public final class BridgeController: ObservableObject {
         openingDevice = false
         reopenTask?.cancel(); reopenTask = nil
         teardownHerdr()
+        // Before anything spins the run loop: a repaint resumed in there
+        // finds the device gone and does not try.
+        deviceConnected = false
         guard device.isConnected else { return }
+        device.seal()
         for call in Self.lightsOffCalls {
             callBlocking(call.method, params: call.params, timeout: replyTimeout)
         }
@@ -265,10 +277,11 @@ public final class BridgeController: ObservableObject {
     /// the emulator, a main-queue block), and both need the loop to run.
     /// Called from inside a main-queue job, the main queue cannot drain, so
     /// the reply never lands and the call waits out its timeout; the write
-    /// itself has already gone out by then.
+    /// itself has already gone out by then. Goes through the seal
+    /// `shutdown()` puts on the device.
     private func callBlocking(_ method: String, params: Any, timeout: TimeInterval) {
         var answered = false
-        guard device.call(method, params: params, completion: { _, _ in answered = true }) != nil
+        guard device.callThroughSeal(method, params: params, completion: { _, _ in answered = true }) != nil
         else { return }
         let deadline = Date().addingTimeInterval(timeout)
         while !answered, Date() < deadline {
@@ -669,6 +682,8 @@ public final class BridgeController: ObservableObject {
         guard deviceConnected else { return }
         do {
             _ = try await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
+            // A stop or a quit may have come in while the first call was out.
+            guard isRunning, deviceConnected else { return }
             let zone = StatusMapper.zone(for: state, config) ?? .dark
             _ = try await device.callAsync(
                 OAI.methodRGBConfig,

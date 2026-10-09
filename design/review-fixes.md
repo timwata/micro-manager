@@ -534,6 +534,22 @@ Notes:
   when `shutdown()` returns and that no call timed out (< 0.5 s; it takes
   ~12 ms). `allLightsOff()` and `shutdown()` now share `lightsOffCalls`.
   `CLAUDE.md` names `shutdown()` as the quit hook.
+- **From the PR review:** the run-loop spin also runs main-queue work queued
+  before the quit. A repaint already waiting on `callAsync`'s main-queue hop
+  could send its lit `threads` call between the two blanking calls (or its
+  `rgbConfig` after them), leaving keys lit after exit. `shutdown()` now
+  calls `WLDevice.seal()` before blanking: `call` refuses everything (as
+  `notConnected`) until the next `connect()`, and `callBlocking` goes through
+  `callThroughSeal`. The seal sits in front of the emulator path too, so the
+  emulator catches the race. On top of that, `shutdown()` clears
+  `deviceConnected` first and `apply()` re-checks `isRunning &&
+  deviceConnected` before its second call. Test:
+  `BridgeReentrancyTests.testShutdownWinsOverAQueuedRepaint`, with 0–3
+  run-loop passes before `shutdown()`. Without the seal it fails for 1–3
+  passes; the seal alone makes it pass. The "never two messages in flight"
+  claim in the doc comment was not strictly true (a repaint's reply may still
+  be outstanding), so it now says only that the blanking calls go one at a
+  time.
 
 ### Phase 3 — Herdr socket concurrency (M1, M2, L7)
 
