@@ -176,30 +176,71 @@ Notes (additions beyond the design):
 Branch `feat/remote-herdr-3-bridge` · PR title `feat: switch the bridge between local and remote herdr`
 · API only; the app still never sets a remote target.
 
-- [ ] Split `stop()` into `teardownHerdr()` + device teardown; split
+- [x] Split `stop()` into `teardownHerdr()` + device teardown; split
       `start()` to call a new `startHerdr()` (§5.2). `stop()`/`start()`
       behaviour for local must be unchanged.
-- [ ] Add `target`, `LinkState link`, `isRemote`, `setTarget(_:)` (§5.1,
+- [x] Add `target`, `LinkState link`, `isRemote`, `setTarget(_:)` (§5.1,
       §5.3); device stays open on switch; clear agent lights before bringing
       up the new target.
-- [ ] Remote bring-up in `startHerdr()`: own an `SSHTunnel`, set
+- [x] Remote bring-up in `startHerdr()`: own an `SSHTunnel`, set
       `HerdrClient.setSocketPath`, mirror tunnel state into `link`,
       `forceRepaint()` on `.connected` (§5.4).
-- [ ] Generation counter so callbacks from a superseded tunnel are ignored
+- [x] Generation counter so callbacks from a superseded tunnel are ignored
       (§7).
-- [ ] `refresh()`: don't surface raw socket errors while the link is
+- [x] `refresh()`: don't surface raw socket errors while the link is
       connecting/failed; clear agents + repaint when a connected tunnel drops
       (§5.4).
-- [ ] Factor the thread list out of `refresh()` into a pure static function
+- [x] Factor the thread list out of `refresh()` into a pure static function
       taking `isRemote`; stack/land threads dark when remote (§5.5).
-- [ ] `handleKeyPress`: stack/land presses → `noteError(...)` only, when
+- [x] `handleKeyPress`: stack/land presses → `noteError(...)` only, when
       remote (§5.5).
-- [ ] Public synchronous `shutdownTunnel()` for the quit hook (§6.5).
-- [ ] Tests: thread list with `isRemote` true/false (stack/land dark vs lit,
+- [x] Public synchronous `shutdownTunnel()` for the quit hook (§6.5).
+- [x] Tests: thread list with `isRemote` true/false (stack/land dark vs lit,
       everything else identical).
-- [ ] Manual: local mode with `WL_EMULATE=1 swift run WLMicroManager` behaves
-      exactly as before (on/off, agent lights, key presses).
-- [ ] `swift test` green.
+- [x] Manual: local mode with `WL_EMULATE=1 swift run WLMicroManager` behaves
+      exactly as before (on/off, agent lights, key presses). Done through the
+      bridge on the virtual pad (`LiveBridgeTargetTests`), not by clicking
+      the app: this phase changes no app code. See below.
+- [x] `swift test` green.
+
+Notes (additions beyond the design):
+
+- `teardownHerdr()` is synchronous (the design wrote `await`); nothing in it
+  needs to wait. It also resets `link` to `.local` (documented as "no tunnel
+  in play: the target is this Mac, or the bridge is off") and calls
+  `HerdrClient.setSocketPath(nil)`, so every bring-up moves the client's
+  generation — even when a remote edited in place keeps its socket path.
+- `refresh()` is split into fetch + `render(_ agents:)`; `setTarget` uses
+  `render([])` to clear the old target's lights. While a remote link is not
+  `.connected`, `refresh()` skips `agent.list` and renders no agents, which
+  is how a drop clears the pad. Local mode still fetches every time and
+  reports a failure as before.
+- A `herdrActive` flag (besides the generation counter) keeps `refresh()`
+  and the lifecycle stream off until `startHerdr()` has pointed the client at
+  the target: the device opens first, and a refresh in that gap would read
+  whatever socket the previous target left. `startHerdr()` is a no-op when
+  already up, so an overlapping `start()` and `setTarget` bring it up once.
+- The generation counter also guards the lifecycle stream's 2 s restart, the
+  status streams' `onClosed` (pane ids are only unique per server), the poll
+  loop and in-flight `agent.list` replies. The lifecycle guard fixes an
+  existing leak too: an off/on within 2 s used to start a second stream. A
+  cancelled debounce no longer clears its successor's handle.
+- Thread list: `BridgeController.padThreads(...)` (internal, `nonisolated
+  static`) rather than a `StatusMapper` function, since it also needs the key
+  bindings and panel state. Tests: `BridgePadThreadsTests`, plus
+  `BridgeTargetTests` (switch while off, remote stack/land press only
+  explains, key intercept still wins).
+- Internal seam `BridgeController.sshPath` (default `/usr/bin/ssh`) for live
+  tests, like `SSHTunnel`'s.
+- Live test `LiveBridgeTargetTests` (virtual pad, real sockets; skipped
+  without Input Monitoring or with `HERDR_SOCKET_PATH` set): local on/off and
+  stack key; local → unreachable remote (`.invalid` host) → local, checking
+  the pad clears without reopening the device, `link` carries the error with
+  no `lastError`, a stack press explains itself, and the abandoned tunnel's
+  retry never comes back; and, with `WL_TEST_REMOTE_HOST`, a remote mirrored
+  through a real tunnel, ssh killed → agents cleared → reconnected → back to
+  local with no ssh left. All pass against the throwaway sshd from Phase 2's
+  manual run (`WL_TEST_SSH_PATH`) and the local Herdr, three runs in a row.
 
 ## Phase 4 — App UI, wiring and docs
 
