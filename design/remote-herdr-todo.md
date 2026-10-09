@@ -266,9 +266,10 @@ Branch `feat/remote-herdr-4-ui` · PR title `feat: pick a remote herdr from the 
       the picker.
 - [x] CLAUDE.md "Things that are easy to get wrong": one line on the owned ssh
       (`ControlMaster=no`, stdin-EOF lifetime) and the env override.
-- [ ] Manual (with `WL_EMULATE=1` and a real host): switch This Mac ↔ remote ↔
+- [x] Manual (with `WL_EMULATE=1` and a real host): switch This Mac ↔ remote ↔
       second remote; kill the ssh process → reconnects; bad host → readable
       error; quit → no ssh left; relaunch → last target restored.
+      Done by the user on their own setup after PR #6 merged.
 - [x] `swift test` green; `./scripts/bundle.sh` succeeds.
 
 Notes (additions beyond the design):
@@ -314,4 +315,4 @@ mode equally).
 
 ## Done
 
-- [ ] All four PRs merged; mark the design doc status as "implemented".
+- [x] All four PRs merged; mark the design doc status as "implemented".

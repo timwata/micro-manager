@@ -1,8 +1,9 @@
 # Design: syncing the pad with a remote Herdr
 
-Status: approved plan, not yet implemented. Written for the implementing
-session; read `CLAUDE.md` first, then work through
-[`remote-herdr-todo.md`](remote-herdr-todo.md).
+Status: implemented (PRs #3–#6) and checked by hand against a real host.
+This document is the plan as approved; where the code
+differs, the notes in [`remote-herdr-todo.md`](remote-herdr-todo.md) are
+authoritative (extra ssh options, two-phase readiness, the Retry button, …).
 
 ## Goal
 
