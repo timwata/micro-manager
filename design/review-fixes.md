@@ -1,6 +1,6 @@
 # Fix plan: code review of `main` (2026-10-09)
 
-Status: in progress. Phases 1–5 implemented.
+Status: in progress. Phases 1–6 implemented.
 
 Source: a whole-repo review of `main` at `c72fefe`. Build and tests were green
 at that commit (169 tests, 0 failures, 11 skipped). Each finding below has an
@@ -747,17 +747,54 @@ Notes:
 
 Branch `fix/review-6-polish` · PR title `fix: bridge and panel robustness`
 
-- [ ] L1: refresh sequencing, plus the out-of-order test in
+- [x] L1: refresh sequencing, plus the out-of-order test in
       `BridgeReentrancyTests`.
-- [ ] L2: the reopen task checks cancellation after its sleep and only clears
+- [x] L2: the reopen task checks cancellation after its sleep and only clears
       its own slot.
-- [ ] L3: `WLDevice.deinit` disconnects before deallocating the buffer.
-- [ ] L4: the panel switch calls `start()`/`stop()` according to `on`.
-- [ ] L5: key-window reloads limited to the panel's own window.
-- [ ] L9: range-free keymap error message.
-- [ ] L10: `WLDevice` declared `@unchecked Sendable` with a confinement
+- [x] L3: `WLDevice.deinit` disconnects before deallocating the buffer.
+- [x] L4: the panel switch calls `start()`/`stop()` according to `on`.
+- [x] L5: key-window reloads limited to the panel's own window.
+- [x] L9: range-free keymap error message.
+- [x] L10: `WLDevice` declared `@unchecked Sendable` with a confinement
       comment; a clean build has zero warnings.
-- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+- [x] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+Notes:
+
+- **L1:** the sequence check sits after the `if linkUp` block, so it also
+  covers a refresh that read nothing because the link was down. That empty
+  pad is newer than a read still in flight from before the drop, and the
+  success path (unlike the error path) never re-checks `linkUp`, so without
+  this the late read would repaint the old agents. `lastError` is cleared
+  only by a read that is actually applied, so a stale success cannot wipe a
+  newer error. The error path is unchanged, as planned.
+- **L1 test:** `Gate` now numbers calls in arrival order and can release one
+  by number (`release(call:with:)`); `release(_:)` still releases them all.
+  The test builds its own bridge with a one-hour `pollInterval`, so no poll
+  can take a call number between the two `forceRepaint()`s. Mutation-checked:
+  without the `seq > refreshApplied` guard it fails with the older agent
+  showing.
+- **L2:** the slot is cleared from a `defer`, only when the task was not
+  cancelled, so the early `return`s are covered too. No test, as planned
+  (no seam makes `openDevice` fail on the emulator).
+- **L3:** no test: the leak needs a real IOKit device. A report already
+  queued to main when the device is released is not a problem: the callback
+  runs on the main run loop (as `deinit` does) and the queued block holds
+  `me` strongly, so `deinit` cannot run while one is pending.
+- **L4:** `BridgeController.toggle()` has no callers left. Kept (scope).
+- **L5:** `WindowReader` reports `view.window` from `viewDidMoveToWindow`.
+  The window is kept weakly in a small class instead of `@State`, so
+  recording it never triggers a view update (it can arrive mid-update).
+  Before the first report the panel's window is unknown and notifications
+  are ignored; `.onAppear` covers that first opening.
+- **L10:** a clean build (`swift build --build-path <tmp>`) has zero
+  warnings. Checked the other way round too: with the conformance removed,
+  the `SendableClosureCaptures` warning at `WLDevice+Async.swift:19` is back.
+- Full suite: 193 tests, 0 failures, 2 skipped. `WL_EMULATE=1` debug app
+  (with `HERDR_SOCKET_PATH` unset) ran for 8 s headless without trouble and
+  was killed. Not checked (no Accessibility grant, no pad): clicking the
+  panel switch, and that opening the emulator window no longer re-reads
+  `remotes` while opening the menu panel still does.
 
 ### Done
 
