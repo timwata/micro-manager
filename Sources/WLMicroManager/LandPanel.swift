@@ -77,6 +77,15 @@ final class LandPanelController {
         }
     }
 
+    /// The pad now mirrors another Herdr, so a confirmation or report for the
+    /// old one's focused agent no longer matches what the keys mean. A land
+    /// already running stays up: it pushes this Mac's repository whatever the
+    /// pad shows, and its window is the only place its outcome appears.
+    func closeForTargetChange() {
+        guard phase != .running else { return }
+        close()
+    }
+
     func close() {
         panel.close()
         phase = .idle

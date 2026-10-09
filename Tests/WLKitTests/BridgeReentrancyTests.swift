@@ -98,6 +98,34 @@ final class BridgeReentrancyTests: XCTestCase {
         XCTAssertTrue(pad.keys[Pad.agentKeyIDs[0]]?.isLit ?? false, "the agent's key lights")
     }
 
+    // MARK: - Retrying a failed link
+
+    /// The panel's Retry: a failed tunnel goes straight back to connecting,
+    /// instead of after its backoff (or, for a permanent failure, never).
+    func testReconnectRetriesAFailedLinkAtOnce() async throws {
+        bridge.listAgents = { [] }
+        await bridge.setTarget(remote)
+        await bridge.start()
+        try await waitUntil("the tunnel fails") {
+            if case .failed = self.bridge.link { return true } else { return false }
+        }
+
+        bridge.reconnect()
+        XCTAssertEqual(bridge.link, .connecting)
+        XCTAssertNil(bridge.lastError, "a link failure is not a bridge error")
+        try await waitUntil("the retry fails too") {
+            if case .failed = self.bridge.link { return true } else { return false }
+        }
+    }
+
+    /// A retry is for the remote the pad mirrors, and only while it is down.
+    func testReconnectLeavesALocalTargetAlone() async {
+        bridge.listAgents = { [] }
+        await bridge.start()
+        bridge.reconnect()
+        XCTAssertEqual(bridge.link, .local)
+    }
+
     // MARK: - Helpers
 
     /// Holds every `agent.list` open until the test releases them all.

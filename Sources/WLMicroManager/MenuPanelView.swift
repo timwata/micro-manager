@@ -7,10 +7,14 @@ struct MenuPanelView: View {
     @EnvironmentObject var bridge: BridgeController
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var inspectorError: String?
+    @State private var configError: String?
+    @State private var remotes: [HerdrRemote] = HerdrRemotes.load()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            Divider()
+            targetSection
             Divider()
 
             if bridge.permissionDenied {
@@ -48,6 +52,13 @@ struct MenuPanelView: View {
             footer
         }
         .frame(width: 300)
+        // Re-read on every opening, so a config edit shows up without a
+        // relaunch. The window may be kept alive between openings, in which
+        // case only becoming key marks a new one.
+        .onAppear { reloadRemotes() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            reloadRemotes()
+        }
     }
 
     // MARK: - Header
@@ -81,7 +92,113 @@ struct MenuPanelView: View {
         guard bridge.deviceConnected else { return "Looking for the pad…" }
         var parts = [bridge.deviceName, bridge.firmware]
         if let battery = bridge.battery { parts.append(battery) }
+        if bridge.link == .connected, let name = bridge.target.remoteName {
+            parts.append("via \(name)")
+        }
         return parts.joined(separator: " · ")
+    }
+
+    // MARK: - Target
+
+    /// `HERDR_SOCKET_PATH` beats any tunnel (see `HerdrClient.socketPath`),
+    /// so offering a choice would only start an ssh nothing reads through.
+    private var targetOverridden: Bool {
+        HerdrClient.environmentOverride != nil
+    }
+
+    private var targetSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("Herdr")
+                Picker("Herdr", selection: targetSelection) {
+                    Text("This Mac").tag(String?.none)
+                    if !pickerRemotes.isEmpty { Divider() }
+                    ForEach(pickerRemotes) { remote in
+                        Text(remote.name).tag(String?.some(remote.name))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .disabled(targetOverridden)
+            }
+
+            if targetOverridden {
+                caption("Overridden by HERDR_SOCKET_PATH")
+            } else if bridge.isRemote {
+                linkStatus
+            } else if remotes.isEmpty {
+                caption("Add hosts under \"remotes\" in config.json")
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 8)
+    }
+
+    /// The selection is the remote's name; nil is this Mac.
+    private var targetSelection: Binding<String?> {
+        Binding(
+            get: { bridge.target.remoteName },
+            set: { name in
+                guard !targetOverridden else { return }
+                BridgeSettings.targetName = name
+                let target = HerdrRemotes.target(named: name, in: pickerRemotes)
+                Task { await bridge.setTarget(target) }
+            }
+        )
+    }
+
+    /// The configured remotes, plus the current one if it has since been
+    /// removed from the config: the pad still mirrors it, and a picker
+    /// showing a blank selection would hide which host that is.
+    private var pickerRemotes: [HerdrRemote] {
+        guard case .remote(let current) = bridge.target,
+              !remotes.contains(where: { $0.name == current.name })
+        else { return remotes }
+        return remotes + [current]
+    }
+
+    @ViewBuilder
+    private var linkStatus: some View {
+        switch bridge.link {
+        case .connected:
+            HStack(spacing: 6) {
+                Circle().fill(Color.green).frame(width: 7, height: 7)
+                caption("Connected via SSH")
+            }
+        case .failed(let message):
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                Spacer(minLength: 0)
+                Button("Retry") { bridge.reconnect() }
+                    .controlSize(.small)
+                    .help("Try to connect again now")
+            }
+        case .connecting, .local:
+            // `.local` with a remote target only while the bridge is off, or
+            // for the instant between a teardown and the next bring-up.
+            caption(bridge.isRunning ? "Connecting…" : "Connects over SSH when switched on")
+        }
+    }
+
+    private func caption(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Picks up config edits. A remote edited in place under the name the
+    /// pad is mirroring is re-applied, the same as choosing it again would.
+    private func reloadRemotes() {
+        remotes = HerdrRemotes.load()
+        guard !targetOverridden, case .remote(let current) = bridge.target,
+              let updated = remotes.first(where: { $0.name == current.name }),
+              updated != current
+        else { return }
+        Task { await bridge.setTarget(.remote(updated)) }
     }
 
     // MARK: - Pad
@@ -104,6 +221,8 @@ struct MenuPanelView: View {
         let isStackKey = index == Pad.stackKeyID
         let isTabCycleKey = index == Pad.tabCycleKeyID
         let isLandKey = index == Pad.landKeyID
+        // Their `but` would run here, in a directory on the other machine.
+        let isUnavailable = bridge.isRemote && (isStackKey || isLandKey)
         let macroText = bridge.keyBindings.text(for: index)
         let isVoiceKey = macroText == nil && Pad.voiceKeyIDs.contains(index)
         // Key index and agent slot are different orderings — the top row is
@@ -135,11 +254,14 @@ struct MenuPanelView: View {
                 )
         }
         .buttonStyle(.plain)
-        .disabled(agent == nil && !isStackKey && !isTabCycleKey && !isLandKey
-                  && macroText == nil && !isVoiceKey)
-        .help(helpText(index, agent: agent, isStackKey: isStackKey,
-                       isTabCycleKey: isTabCycleKey, isLandKey: isLandKey,
-                       macroText: macroText, isVoiceKey: isVoiceKey))
+        .disabled(isUnavailable
+                  || (agent == nil && !isStackKey && !isTabCycleKey && !isLandKey
+                      && macroText == nil && !isVoiceKey))
+        .help(isUnavailable
+              ? "Not available for a remote Herdr"
+              : helpText(index, agent: agent, isStackKey: isStackKey,
+                         isTabCycleKey: isTabCycleKey, isLandKey: isLandKey,
+                         macroText: macroText, isVoiceKey: isVoiceKey))
     }
 
     private func helpText(
@@ -241,31 +363,32 @@ struct MenuPanelView: View {
                     }
                 }
 
-            Toggle("Emulate the pad", isOn: Binding(
-                get: { bridge.emulator != nil },
-                set: { on in
-                    BridgeSettings.emulate = on
-                    Task {
-                        await bridge.useEmulator(on)
-                        if let emulator = bridge.emulator {
-                            EmulatorWindowController.shared.show(emulator)
-                        } else {
-                            EmulatorWindowController.shared.close()
+            // The button row below is full, so the config button sits here.
+            HStack {
+                Toggle("Emulate the pad", isOn: Binding(
+                    get: { bridge.emulator != nil },
+                    set: { on in
+                        BridgeSettings.emulate = on
+                        Task {
+                            await bridge.useEmulator(on)
+                            if let emulator = bridge.emulator {
+                                EmulatorWindowController.shared.show(emulator)
+                            } else {
+                                EmulatorWindowController.shared.close()
+                            }
                         }
                     }
-                }
-            ))
-            .toggleStyle(.checkbox)
-            .padding(.horizontal, 14).padding(.top, 4)
-            .help("Drive a virtual pad instead of the hardware")
-
-            if let inspectorError {
-                Text(inspectorError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 14).padding(.top, 6)
+                ))
+                .toggleStyle(.checkbox)
+                .help("Drive a virtual pad instead of the hardware")
+                Spacer()
+                Button("Edit Config…") { editConfig() }
+                    .help("Open config.json: macro keys, dial and joystick lists, remote Herdr hosts")
             }
+            .padding(.horizontal, 14).padding(.top, 4)
+
+            if let inspectorError { footerError(inspectorError) }
+            if let configError { footerError(configError) }
 
             HStack {
                 Button("Refresh") { Task { await bridge.forceRepaint() } }
@@ -279,6 +402,42 @@ struct MenuPanelView: View {
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
             .padding(.horizontal, 14).padding(.vertical, 8)
+        }
+    }
+
+    private func footerError(_ message: String) -> some View {
+        Text(message)
+            .font(.caption)
+            .foregroundStyle(.red)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 14).padding(.top, 6)
+    }
+
+    /// Opens the config file, creating an empty one first: everything works
+    /// without it, so on most Macs there is nothing to open yet.
+    private func editConfig() {
+        configError = nil
+        let path = KeyBindings.configPath()
+        let url = URL(fileURLWithPath: path)
+        let files = FileManager.default
+        if !files.fileExists(atPath: path) {
+            do {
+                try files.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                // Never clobber a file that appeared since the check.
+                try Data("{}\n".utf8).write(to: url, options: .withoutOverwriting)
+            } catch {
+                configError = "Could not create \(path): \(error.localizedDescription)"
+                return
+            }
+        }
+        // A Mac without Xcode or an editor that claims .json has no default
+        // app for it, and `open` would fail silently; TextEdit is always there.
+        if NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+            NSWorkspace.shared.open(url)
+        } else if let textEdit = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit") {
+            NSWorkspace.shared.open([url], withApplicationAt: textEdit, configuration: NSWorkspace.OpenConfiguration())
+        } else {
+            configError = "No app to open \(path) with."
         }
     }
 }

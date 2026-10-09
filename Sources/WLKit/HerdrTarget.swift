@@ -45,6 +45,12 @@ public struct HerdrRemote: Equatable, Sendable, Identifiable {
 public enum HerdrTarget: Equatable, Sendable {
     case local
     case remote(HerdrRemote)
+
+    /// The remote's name, or nil for this Mac — what the selection is
+    /// persisted as.
+    public var remoteName: String? {
+        if case .remote(let remote) = self { return remote.name } else { return nil }
+    }
 }
 
 public enum HerdrRemotes {
@@ -57,6 +63,15 @@ public enum HerdrRemotes {
             return []
         }
         return parse(data)
+    }
+
+    /// The target a persisted selection names, looked up in the current
+    /// config. A remote is kept by name only, so an entry edited since takes
+    /// effect, and one removed since falls back to this Mac rather than
+    /// leaving the pad pointed at a host nobody configured any more.
+    public static func target(named name: String?, in remotes: [HerdrRemote]) -> HerdrTarget {
+        guard let name, let remote = remotes.first(where: { $0.name == name }) else { return .local }
+        return .remote(remote)
     }
 
     /// Same tolerance as `KeyBindings.parse`: a malformed file or entry is

@@ -96,6 +96,30 @@ final class BridgeTargetTests: XCTestCase {
         XCTAssertFalse(bridge.isRemote)
     }
 
+    /// The app closes its Stack and Land windows on this, so it must fire on
+    /// every real change — running or not — and never on a no-op.
+    func testTargetChangesAreReportedOnce() async {
+        let bridge = BridgeController()
+        var seen: [HerdrTarget] = []
+        bridge.onTargetChange = { seen.append($0) }
+
+        await bridge.setTarget(.remote(box))
+        await bridge.setTarget(.remote(box))
+        await bridge.setTarget(.local)
+        await bridge.setTarget(.local)
+        XCTAssertEqual(seen, [.remote(box), .local])
+    }
+
+    /// Nothing to retry: no tunnel while off, and none for this Mac.
+    func testReconnectWithoutAFailedLinkDoesNothing() async {
+        let bridge = BridgeController()
+        bridge.reconnect()
+        await bridge.setTarget(.remote(box))
+        bridge.reconnect()
+        XCTAssertEqual(bridge.link, .local)
+        XCTAssertFalse(bridge.isRunning)
+    }
+
     func testRemoteStackAndLandPressesOnlyExplain() async {
         let bridge = BridgeController()
         var opened: [String] = []
