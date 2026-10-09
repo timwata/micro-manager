@@ -1,6 +1,6 @@
 # Fix plan: code review of `main` (2026-10-09)
 
-Status: in progress. Phase 1 implemented.
+Status: in progress. Phases 1–2 implemented.
 
 Source: a whole-repo review of `main` at `c72fefe`. Build and tests were green
 at that commit (169 tests, 0 failures, 11 skipped). Each finding below has an
@@ -497,13 +497,43 @@ Notes:
 
 Branch `fix/review-2-land-scope` · PR title `fix: land only the branches the user confirmed`
 
-- [ ] `GitButler.LandStep` and `GitButler.nextLandStep(plan:confirmed:landed:)`
+- [x] `GitButler.LandStep` and `GitButler.nextLandStep(plan:confirmed:landed:)`
       with the five rules in H2.
-- [ ] `LandPanelController.land()` captures `confirmed` before the first
+- [x] `LandPanelController.land()` captures `confirmed` before the first
       `await` and loops on `nextLandStep`; `.stop` messages go to the panel;
       `maxLands` kept.
-- [ ] Tests for all five cases listed in H2.
-- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+- [x] Tests for all five cases listed in H2.
+- [x] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+Notes:
+
+- The tests are a new `GitButlerLandStepTests`, one per case in H2. The
+  messages are exactly the two in H2; "Not landed" lists plain branch names
+  joined with ", ".
+- With an empty `confirmed`, rule 3 answers `.done`. `land()` never gets
+  there (the confirmation needs a non-empty plan), and doing nothing is the
+  safe answer anyway.
+- A confirmed branch that vanished from the plan without us landing it (say,
+  landed from elsewhere) still counts as "not landed". If only unconfirmed
+  branches are left in front, rule 4 stops and names it, which is accurate.
+- **Out of plan, at the user's request:** the app left the pad lit after
+  Quit. `applicationWillTerminate` only called `shutdownTunnel()`, and no
+  `Task` gets to run after it returns, so `stop()` could not have helped.
+  Fixed in the same PR with a synchronous `BridgeController.shutdown()`. It
+  tears down the Herdr side (including the tunnel), sends the same two
+  blanking calls as `stop()`, closes the device, and leaves the persisted
+  on/off alone. Each call still waits for its reply, as every other call
+  does, by spinning the main run loop in default mode with a 0.5 s bound per
+  call. That works when `terminate` comes from event handling, as Quit and
+  the logout Apple event do. Inside a main-queue job, the reply (delivered
+  via `DispatchQueue.main.async`) cannot arrive, so each call waits out its
+  bound. The writes themselves are synchronous (`IOHIDDeviceSetReport`), so
+  the pad still goes dark, just up to 1 s later. Test:
+  `BridgeReentrancyTests.testShutdownDarkensThePadBeforeReturning` is
+  synchronous for exactly that reason. It checks that the emulator is dark
+  when `shutdown()` returns and that no call timed out (< 0.5 s; it takes
+  ~12 ms). `allLightsOff()` and `shutdown()` now share `lightsOffCalls`.
+  `CLAUDE.md` names `shutdown()` as the quit hook.
 
 ### Phase 3 — Herdr socket concurrency (M1, M2, L7)
 
@@ -578,3 +608,7 @@ Branch `fix/review-6-polish` · PR title `fix: bridge and panel robustness`
 
 (Problems discovered while working through the phases go here, not into the
 current PR.)
+
+- **Pad stayed lit after Quit** (found by the user while Phase 2 was in
+  progress). Fixed in the Phase 2 PR at the user's request; see Phase 2's
+  Notes.
