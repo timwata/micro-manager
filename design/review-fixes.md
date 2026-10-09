@@ -1,6 +1,6 @@
 # Fix plan: code review of `main` (2026-10-09)
 
-Status: in progress. Phases 1–2 implemented.
+Status: in progress. Phases 1–3 implemented.
 
 Source: a whole-repo review of `main` at `c72fefe`. Build and tests were green
 at that commit (169 tests, 0 failures, 11 skipped). Each finding below has an
@@ -555,21 +555,66 @@ Notes:
 
 Branch `fix/review-3-herdr-socket` · PR title `fix: race-free herdr requests and socket teardown`
 
-- [ ] M1: `request` guards `finished` with a lock (same pattern as
+- [x] M1: `request` guards `finished` with a lock (same pattern as
       `SSHTunnel.probe`).
-- [ ] M1 test: a late timeout after a reply is harmless.
-- [ ] M2: `close()` only shuts the socket down; `readLoop` alone closes the fd;
+- [x] M1 test: a late timeout after a reply is harmless.
+- [x] M2: `close()` only shuts the socket down; `readLoop` alone closes the fd;
       `write()` checks `closed`.
-- [ ] M2 test: 200 concurrent echo requests against a multi-connection fake
+- [x] M2 test: 200 concurrent echo requests against a multi-connection fake
       server, each getting its own token back.
-- [ ] L7: an error acknowledgement closes the stream with `HerdrError.api`
+- [x] L7: an error acknowledgement closes the stream with `HerdrError.api`
       and never calls `onReady`; `stopped`/`ready` lock-protected.
-- [ ] L7 test with `FakeHerdrServer`.
-- [ ] **verify** TSan run (`--sanitize=thread`) over the socket tests,
+- [x] L7 test with `FakeHerdrServer`.
+- [x] **verify** TSan run (`--sanitize=thread`) over the socket tests,
       before and after; results in Notes.
-- [ ] `SSHTunnelTests` and `BridgeReentrancyTests` still pass (both use
+- [x] `SSHTunnelTests` and `BridgeReentrancyTests` still pass (both use
       `SocketConnection`, directly or through the bridge).
-- [ ] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+- [x] `swift build -c release` and `env -u HERDR_SOCKET_PATH swift test` green.
+
+Notes:
+
+- **TSan, before the fix** (`--sanitize=thread` over `HerdrClientRequestTests`,
+  `HerdrEventStreamTests` and `HerdrSocketPathTests`): one data race, exactly
+  the one M1 predicted — the timeout's read of `finished` on a global queue
+  against the reply's write on the socket's queue, in `request`. The
+  `stopped`/`ready` accesses of L7 were not flagged: in these tests only the
+  socket's queue touches them after `start()`. **After:** zero warnings over
+  the same tests plus `SSHTunnelTests`.
+- **M2 did not reproduce before the fix**: the echo tests passed five runs out
+  of five, and TSan does not see it either (every `fd` access was already
+  under the lock; the bug is the number going stale between the unlock and
+  `read()`). The window is a few instructions wide. The tests stay as
+  regression guards.
+- **M2 deviation:** `close()` calls `shutdown` *under* the lock, not outside
+  it. Outside, the read loop could end on its own (the peer closed) between
+  `close()` reading `fd` and the shutdown, close the fd, and let the number
+  be reused, so the shutdown would hit someone else's socket. The loop gives
+  up `fd` under the same lock before closing it, so a number `close()` sees
+  under the lock is still ours. `shutdown` does not block.
+- The read loop now reads `fd` once, before its loop: nobody else closes it,
+  so the number stays valid until the loop closes it itself.
+- **M2 test additions:** besides the 200 echo requests, a second test sends
+  400, half of which the server never answers (0.05 s timeout), so timeouts
+  close connections from a global queue while other requests open sockets —
+  the path that could actually recycle a number under a blocked loop. Both
+  tests keep at most 64 requests in flight: the fake server answers on one
+  thread, macOS caps the listen backlog at 128, and a Unix socket refuses a
+  connect outright (`ECONNREFUSED`) when the backlog is full. Under TSan, a
+  thread-per-client server overflowed it with 200 at once.
+- `FakeHerdrServer` moved out of `HerdrSocketPathTests.swift` into a shared
+  `FakeHerdrServers.swift` (no longer `private`), next to the new
+  `EchoHerdrServer`. The M1 and M2 tests are a new `HerdrClientRequestTests`;
+  the L7 test (plus a control: an accepted subscription is ready and delivers
+  the next line as an event) is a new `HerdrEventStreamTests`.
+- The L7 test counts `onReady` calls instead of using an inverted
+  expectation: a fulfilled inverted expectation ended
+  `fulfillment(of:timeout:)` early without reporting a failure.
+- L7 checks the acknowledgement for an `error` object the same way `request`
+  does (`[String: Any]` with an optional `message`, else "api error").
+- Headless: `WL_EMULATE=1 .build/debug/WLMicroManager` against a local Herdr
+  held 4 Unix sockets at both 6 s and 11 s after launch (as in Phase 1), so
+  polling does not leak connections. `LiveHerdrTests` (5) pass against the
+  local Herdr.
 
 ### Phase 4 — Ordered dial and joystick commands (M3, L6)
 
@@ -628,3 +673,13 @@ current PR.)
 - **Pad stayed lit after Quit** (found by the user while Phase 2 was in
   progress). Fixed in the Phase 2 PR at the user's request; see Phase 2's
   Notes.
+- **Every Herdr request leaks its `SocketConnection`** (found during Phase 3,
+  not fixed there). In `HerdrClient.request`, `conn.onLine` and
+  `conn.onClosed` capture `finish`, which captures `conn` strongly, and
+  nothing ever clears the callbacks; `SSHTunnel.probe` has the same shape.
+  `leaks` on `WL_EMULATE=1 .build/debug/WLMicroManager` after 12 s against a
+  local Herdr: `ROOT CYCLE: <SocketConnection …>` (about 2.6 KB each, with its
+  dispatch queue), one per request. The fd itself is closed. The poll alone
+  makes a request every 2.5 s, so the app grows by roughly 90 MB a day.
+  Likely fix: have the read loop drop `onLine`/`onClosed` when it exits, or
+  capture `conn` weakly in `finish`.
