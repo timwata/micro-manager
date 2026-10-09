@@ -121,6 +121,42 @@ public enum GitButler {
         return try parseLandPlan(Data(output.text.utf8))
     }
 
+    /// What a confirmed land does next, given a freshly read plan.
+    public enum LandStep: Equatable, Sendable {
+        case land(String)
+        case done
+        /// Stop without landing; the message is for the panel.
+        case stop(String)
+    }
+
+    /// Decides the next land from the current plan, so a land only ever
+    /// pushes what the user confirmed.
+    ///
+    /// The plan is re-read after every land, because each land rebases what
+    /// is left. That same re-read can surface a branch an agent created or
+    /// applied while the confirmation was up, which the user never agreed to
+    /// push. Such a branch is never landed. When it sits in front of a
+    /// confirmed one, the land stops rather than skipping it: skipping would
+    /// land the stack out of order.
+    public static func nextLandStep(
+        plan: [String], confirmed: [String], landed: Set<String>
+    ) -> LandStep {
+        guard let next = plan.first else { return .done }
+        if landed.contains(next) {
+            return .stop("`\(next)` is still in the workspace after landing it; stopping here.")
+        }
+        let remaining = confirmed.filter { !landed.contains($0) }
+        // Whatever is left was never agreed to, so it stays where it is.
+        if remaining.isEmpty { return .done }
+        guard confirmed.contains(next) else {
+            return .stop(
+                "`\(next)` was not in the confirmed plan; stopping before it. "
+                    + "Not landed: \(remaining.joined(separator: ", "))."
+            )
+        }
+        return .land(next)
+    }
+
     static func parseLandPlan(_ data: Data) throws -> [String] {
         guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let stacks = json["stacks"] as? [[String: Any]]

@@ -182,6 +182,9 @@ final class LandPanelController {
 
     private func land() async {
         guard phase == .confirming, let directory else { return }
+        // Taken before the first await: `close()` clears `plan`, and this is
+        // the only record of what the user agreed to land.
+        let confirmed = plan
         phase = .running
         generation += 1
         let generation = self.generation
@@ -194,7 +197,8 @@ final class LandPanelController {
 
         // The plan is refreshed after every land rather than iterated: each
         // land rebases what is left, and the confirmation's list is a promise
-        // of intent, not of object identity.
+        // of intent, not of object identity. `nextLandStep` keeps the refresh
+        // from widening that promise to branches that appeared since.
         var landed = Set<String>()
         for _ in 0..<Self.maxLands {
             let plan: [String]
@@ -204,13 +208,11 @@ final class LandPanelController {
                 panel.append(PanelHTML.note(error.localizedDescription))
                 break
             }
-            guard let branch = plan.first else { break }
-            guard !landed.contains(branch) else {
-                panel.append(PanelHTML.note(
-                    "`\(branch)` is still in the workspace after landing it; stopping here."
-                ))
-                break
+            let step = GitButler.nextLandStep(plan: plan, confirmed: confirmed, landed: landed)
+            if case .stop(let message) = step {
+                panel.append(PanelHTML.note(message))
             }
+            guard case .land(let branch) = step else { break }
             landed.insert(branch)
 
             panel.append(PanelHTML.command("but land --yes \(branch)"))
