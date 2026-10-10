@@ -102,7 +102,8 @@ public final class PadEmulator: ObservableObject {
             return (["ok": 1], nil)
 
         case "host.focused_app":
-            return (["ok": 1], nil)
+            // A bare null on the device, unlike the lighting calls' {"ok":1}.
+            return (NSNull(), nil)
 
         default:
             // Notifications are not callable, and neither is anything else the
