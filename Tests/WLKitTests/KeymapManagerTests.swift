@@ -150,32 +150,57 @@ final class KeymapManagerTests: XCTestCase {
 
     /// One layout per part `withAgentKeymap` skips but `isAgentKeymapApplied`
     /// requires: a key outside the matrix, a dial without both rotation
-    /// slots, a joystick without its north sector.
-    private func unplaceableLayouts() throws -> [(name: String, config: [String: Any])] {
+    /// slots, a joystick without its north sector. `unbound` is what stays
+    /// without an AG code once everything else is bound.
+    private func unplaceableLayouts() throws -> [(name: String, config: [String: Any], unbound: Set<Int>)] {
         [
             ("a key outside the matrix", try stockKeymap { layout in
                 var keymap = layout["keymap"] as! [[String]]
                 keymap[3].removeLast()
                 layout["keymap"] = keymap
-            }),
+            }, [12]),
             ("a dial with one slot", try stockKeymap { layout in
                 layout["encoders"] = [["KC_MPLY"]]
-            }),
+            }, [Pad.dialUpID, Pad.dialDownID]),
             ("a joystick without north", try stockKeymap { layout in
                 var joystick = layout["joystick"] as! [String: Any]
                 var sectors = joystick["sectors"] as! [[String: Any]]
                 sectors.removeAll { $0["k"] as? String == "KI_X" }
                 joystick["sectors"] = sectors
                 layout["joystick"] = joystick
-            }),
+            }, [Pad.joyNorthID]),
         ]
     }
 
     func testLayoutsWithoutASlotCannotBeApplied() throws {
-        for (name, config) in try unplaceableLayouts() {
+        for (name, config, _) in try unplaceableLayouts() {
             let next = try KeymapManager.withAgentKeymap(config)
             XCTAssertFalse(KeymapManager.isAgentKeymapApplied(next), name)
         }
+    }
+
+    /// `apply` writes a partial binding only when the rewrite changes
+    /// something, and tells by `NSDictionary` equality. The config it reads
+    /// back is Foundation types from `JSONSerialization`, while the rewrite
+    /// goes through Swift arrays and dictionaries, so the comparison must
+    /// still see a partially bound config as unchanged, and a stock one as
+    /// changed.
+    func testARewriteOfAPartiallyBoundLayoutIsUnchanged() throws {
+        for (name, config, _) in try unplaceableLayouts() {
+            let stock = try roundTrip(config)
+            let once = try KeymapManager.withAgentKeymap(stock)
+            XCTAssertFalse((once as NSDictionary).isEqual(to: stock), "\(name): stock is rewritten")
+
+            let read = try roundTrip(once)
+            let twice = try KeymapManager.withAgentKeymap(read)
+            XCTAssertTrue((twice as NSDictionary).isEqual(to: read), "\(name): bound once is final")
+        }
+    }
+
+    /// The config as a device would hand it back after a write.
+    private func roundTrip(_ config: [String: Any]) throws -> [String: Any] {
+        let data = try JSONSerialization.data(withJSONObject: config)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
     /// The fs.write calls the emulator has taken, from its traffic log.
@@ -183,11 +208,13 @@ final class KeymapManagerTests: XCTestCase {
         emulator.traffic.filter { $0.hasPrefix("fs.write") }.count
     }
 
-    /// A layout that cannot take the bindings must not cost a flash write:
-    /// it would be written again, and fail again, on every start and every
-    /// reconnect.
-    func testApplyWritesNothingWhenTheLayoutHasNoSlot() async throws {
-        for (name, config) in try unplaceableLayouts() {
+    /// A layout that cannot take every binding still gets the ones it has a
+    /// slot for, since those keys light, but in one write only: a write per
+    /// start and per reconnect would wear the flash and fail every time.
+    func testApplyBindsWhatHasASlotAndWritesItOnce() async throws {
+        let all = Set(Pad.boundKeyIDs + [Pad.dialUpID, Pad.dialDownID]
+                      + [Pad.joyNorthID, Pad.joyWestID, Pad.joySouthID, Pad.joyEastID])
+        for (name, config, unbound) in try unplaceableLayouts() {
             let emulator = PadEmulator()
             let device = WLDevice(emulator: emulator)
             try device.connect()
@@ -195,15 +222,20 @@ final class KeymapManagerTests: XCTestCase {
                                             encoding: .utf8))
             _ = try await device.callAsync("fs.write", params: ["file": "keymap.json", "data": text])
             XCTAssertEqual(writes(emulator), 1, name)
+            XCTAssertEqual(emulator.bound, [], "\(name): starts on the stock F-keys")
 
-            do {
-                _ = try await KeymapManager.apply(device)
-                XCTFail("\(name): expected cannotApply")
-            } catch KeymapManager.Failure.cannotApply {
-            } catch {
-                XCTFail("\(name): expected cannotApply, got \(error)")
+            for attempt in ["first", "second"] {
+                do {
+                    _ = try await KeymapManager.apply(device)
+                    XCTFail("\(name), \(attempt) apply: expected cannotApply")
+                } catch KeymapManager.Failure.cannotApply {
+                } catch {
+                    XCTFail("\(name), \(attempt) apply: expected cannotApply, got \(error)")
+                }
+                XCTAssertEqual(writes(emulator), 2, "\(name), \(attempt) apply: one write in all")
+                XCTAssertEqual(emulator.bound, all.subtracting(unbound),
+                               "\(name), \(attempt) apply: what has a slot is bound")
             }
-            XCTAssertEqual(writes(emulator), 1, "\(name): apply must not write")
             device.disconnect(reason: nil)
         }
     }
