@@ -159,12 +159,10 @@ public final class BridgeController: ObservableObject {
             if self.isRunning { self.scheduleReopen() }
         }
         device.onTX = { [weak self] _, _, id in
-            self?.issuedIDs.insert(id)
+            self?.noteIssued(id: id)
         }
         device.onResponse = { [weak self] id, _, _ in
-            guard let self else { return }
-            // A reply to an id we never sent came from another client.
-            if self.issuedIDs.remove(id) == nil { self.contendingClient = true }
+            self?.noteResponse(id: id)
         }
         device.onNotification = { [weak self] method, params in
             guard let self, method == OAI.notifyHID else { return }
@@ -173,6 +171,30 @@ public final class BridgeController: ObservableObject {
             guard let index = OAI.agIndex(dict["k"] as? String) else { return }
             self.handleKeyPress(index)
         }
+    }
+
+    /// Every call the bridge sends. Internal so tests can put an id in flight
+    /// without racing the emulator's reply hop.
+    func noteIssued(id: Int) { issuedIDs.insert(id) }
+
+    /// Every reply the pad sends, ours or not. Internal so tests can land a
+    /// reply id the bridge never issued, as another client's would.
+    func noteResponse(id: Int) {
+        // A reply to an id we never sent came from another client.
+        if issuedIDs.remove(id) == nil { contendingClient = true }
+    }
+
+    /// The panel's Recheck: clears the warning, and repaints so our colours
+    /// replace whatever the other app left on the pad. Detection is passive,
+    /// so this proves nothing by itself — the warning comes back as soon as
+    /// the other app, if it is still there, sends to the pad again.
+    public func recheckContention() async {
+        // `issuedIDs` is left alone on purpose: a reply to one of our own
+        // calls still in flight would otherwise look foreign and raise the
+        // warning again at once.
+        contendingClient = false
+        guard isRunning else { return }
+        await forceRepaint()
     }
 
     // MARK: - Lifecycle
@@ -202,6 +224,11 @@ public final class BridgeController: ObservableObject {
         reopenTask?.cancel(); reopenTask = nil
         teardownHerdr()
         await teardownDevice()
+        // An off bridge drives nothing, so there is nothing to fight over.
+        // Cleared after the teardown, whose lights-off calls wait on replies
+        // that another client's may land among; a start() that came in
+        // meanwhile owns the flag.
+        if !isRunning { contendingClient = false }
     }
 
     /// Points the pad at another Herdr server. Takes effect at once while

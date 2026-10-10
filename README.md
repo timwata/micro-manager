@@ -289,9 +289,12 @@ is opened shared, so we receive other clients' replies, and a response id we
 never issued is a reliable tell. The **Inspector** counts too: it is a separate
 process with its own connection to the pad.
 
-Once raised, the warning stays until the manager is switched off and on again,
-even after the other app has quit. A way to clear it without that is planned in
-[design/pad-contention.md](design/pad-contention.md).
+Detection is passive, so once raised the warning stays, even after the other
+app has quit. Quit it, then press **Recheck** next to the warning: that clears
+it and repaints the pad with the manager's colours. If the other app is still
+there, the warning comes back as soon as it next sends to the pad. Switching
+the manager off clears the warning too. An active check that clears it by
+itself is planned in [design/pad-contention.md](design/pad-contention.md).
 
 ## Development
 
