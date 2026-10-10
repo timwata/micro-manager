@@ -231,11 +231,7 @@ public final class BridgeController: ObservableObject {
     func noteResponse(id: Int, result: Any?, error: String?) {
         // A reply to an id we never sent came from another client.
         guard issuedIDs.remove(id) == nil else { return }
-        // Not every call is about the lighting. Input announces the frontmost
-        // app (`host.focused_app`) on every app switch, and the firmware
-        // answers that with a bare null; lighting calls are answered
-        // {"ok":1}. A null reply cannot be a fight over the colours.
-        guard error != nil || !(result == nil || result is NSNull) else { return }
+        guard Self.isAboutTheLighting(result: result, error: error) else { return }
         // Scan to see who may have sent it, at most once a second. A reply
         // within the window still raises the warning; it is laid at the
         // clients of the last scan.
@@ -250,6 +246,20 @@ public final class BridgeController: ObservableObject {
         default: traffic = .unattributed
         }
         reconcile()
+    }
+
+    /// Whether another client's reply may be a fight over the colours. Only
+    /// the reply's shape is seen, never the call behind it. The lighting
+    /// calls (and keymap writes) are answered `{"ok":1}`; everything else
+    /// Input sends unprompted is not about the lighting: `host.focused_app`
+    /// on every app switch (a bare null), and `device.status` — or
+    /// `sys.version` if that fails — each time it reconnects, which it does
+    /// on every screen unlock (an object without `ok`). An error still
+    /// counts: nothing says what the failed call was.
+    static func isAboutTheLighting(result: Any?, error: String?) -> Bool {
+        if error != nil { return true }
+        guard let dict = result as? [String: Any] else { return false }
+        return dict["ok"] != nil
     }
 
     /// Re-reads who else holds the pad open, without repainting. The panel
