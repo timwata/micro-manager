@@ -219,37 +219,59 @@ Panel copy:
 
 Branch `feat/contention-1-recheck` · PR title `feat: recheck the "another app" warning`
 
-- [ ] `BridgeController.noteResponse(id:)` (internal) holds the reply-id
+- [x] `BridgeController.noteResponse(id:)` (internal) holds the reply-id
       check; the `onResponse` closure in `wire(_:)` calls it.
-- [ ] `BridgeController.recheckContention()` clears `contendingClient` and,
+- [x] `BridgeController.recheckContention()` clears `contendingClient` and,
       when running, `forceRepaint()`s. `issuedIDs` is left alone, with a
       comment saying why.
-- [ ] `stop()` clears `contendingClient`.
-- [ ] Panel: **Recheck** button in the warning row, laid out like **Retry**,
+- [x] `stop()` clears `contendingClient`.
+- [x] Panel: **Recheck** button in the warning row, laid out like **Retry**,
       with the help text from Part 1.
-- [ ] Tests (`BridgeContentionTests`, on the emulator):
-  - [ ] a foreign id sets the flag; replies to the bridge's own calls never
+- [x] Tests (`BridgeContentionTests`, on the emulator):
+  - [x] a foreign id sets the flag; replies to the bridge's own calls never
         do (start, repaint, check);
-  - [ ] `recheckContention()` clears it, and a foreign id afterwards sets it
+  - [x] `recheckContention()` clears it, and a foreign id afterwards sets it
         again;
-  - [ ] `stop()` clears it;
-  - [ ] a recheck while a repaint is in flight does not re-raise it (gate
+  - [x] `stop()` clears it;
+  - [x] a recheck while a repaint is in flight does not re-raise it (gate
         the repaint's device call or start the recheck before the emulator's
         reply hop, then let it finish and check the flag).
-- [ ] Each test mutation-checked (for example: clear `issuedIDs` in the
+- [x] Each test mutation-checked (for example: clear `issuedIDs` in the
       recheck and watch the last test fail).
-- [ ] `README.md` "Only one bridge at a time": the warning stays until the
+- [x] `README.md` "Only one bridge at a time": the warning stays until the
       other app has quit and **Recheck** is pressed (or the bridge is
       switched off and on); the Inspector counts as another app.
-- [ ] `CLAUDE.md` "Only one HID client at a time" bullet mentions
+- [x] `CLAUDE.md` "Only one HID client at a time" bullet mentions
       `recheckContention()` and that `issuedIDs` must survive it.
 - [ ] User checks listed in the PR: open the Inspector from the panel, see
       the warning, quit the Inspector, press **Recheck**, warning gone and
       pad repainted; switch off with the warning up, warning gone.
-- [ ] `swift build -c release` (zero warnings) and
+- [x] `swift build -c release` (zero warnings) and
       `env -u HERDR_SOCKET_PATH swift test` green.
 
 Notes:
+
+- `stop()` clears `contendingClient` *after* the device teardown, and only if
+  no `start()` came in meanwhile: the lights-off calls wait on replies, and
+  another client's reply landing among them would otherwise leave the
+  warning up on an off bridge.
+- A recheck while off only clears the flag; there is nothing to repaint.
+- The in-flight test cannot gate the emulator's device call without a new
+  seam, so it starts a repaint and a recheck as two main-actor tasks and
+  puts 0–6 yields in front of the recheck, one bridge for all counts. With
+  the mutation (recheck clears `issuedIDs`), 1 or 2 of the counts land in
+  the gap between the emulator's send hop and its reply hop (which ones
+  varies with scheduling: seen 3+4, 1+4, 4), and the test fails; without
+  it, all pass.
+- Mutation checks, each restored afterwards: recheck clears `issuedIDs` →
+  the in-flight test fails (3 runs, every one failed); recheck leaves the
+  flag set → the recheck and stop tests fail; recheck skips the repaint →
+  the recheck test fails ("the recheck repainted the key"); `stop()` keeps
+  the flag → the stop test fails; every reply counts as foreign → the
+  own-replies, recheck and in-flight tests fail; no reply ever counts →
+  every test that raises the flag fails.
+- No hardware or UI check was done in-session; the panel button and the
+  Inspector round trip are user checks in the PR.
 
 ### Phase 2 — Registry scan in WLKit (option C, part 1)
 

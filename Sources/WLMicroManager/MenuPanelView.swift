@@ -39,13 +39,19 @@ struct MenuPanelView: View {
 
             if bridge.contendingClient {
                 Divider()
-                Label(
-                    "Another app is also driving this pad — colours may fight.",
-                    systemImage: "exclamationmark.triangle"
-                )
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label(
+                        "Another app is also driving this pad — colours may fight.",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button("Recheck") { Task { await bridge.recheckContention() } }
+                        .controlSize(.small)
+                        .help("Clear the warning. It comes back if the other app sends to the pad again.")
+                }
                 .padding(.horizontal, 14).padding(.vertical, 8)
             }
 
