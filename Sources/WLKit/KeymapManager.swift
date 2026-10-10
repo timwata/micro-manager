@@ -53,12 +53,17 @@ public enum KeymapManager {
 
     public enum Failure: LocalizedError {
         case noProfiles
+        /// The layout has no slot for some binding, so no write could help.
+        case cannotApply
+        /// The write went out, and the keymap read back still lacks a binding.
         case notAccepted
         case unreadable(String)
 
         public var errorDescription: String? {
             switch self {
             case .noProfiles: return "Device keymap has no profiles."
+            case .cannotApply:
+                return "The device keymap's layout has no slot for every agent binding, so nothing was written. Put the keys, the dial and the joystick back to their default positions in Work Louder's Input app."
             case .notAccepted: return "The device did not accept the agent keymap."
             case .unreadable(let detail): return "Could not read the device keymap: \(detail)"
             }
@@ -203,12 +208,20 @@ public enum KeymapManager {
     }
 
     /// Returns true when it had to change something.
+    ///
+    /// `withAgentKeymap` skips what it cannot place (a key outside the
+    /// matrix, a dial with fewer than two slots, a joystick missing a
+    /// cardinal sector), while `isAgentKeymapApplied` requires all of it. So
+    /// the result is checked before the write: a layout that cannot take the
+    /// bindings would otherwise cost a flash write on every start and every
+    /// reconnect, and fail each time anyway.
     @discardableResult
     public static func apply(_ device: WLDevice) async throws -> Bool {
         let config = try await read(device)
         if isAgentKeymapApplied(config) { return false }
 
         let next = try withAgentKeymap(config)
+        guard isAgentKeymapApplied(next) else { throw Failure.cannotApply }
         let encoded = try JSONSerialization.data(withJSONObject: next)
         guard let text = String(data: encoded, encoding: .utf8) else {
             throw Failure.unreadable("could not encode keymap")

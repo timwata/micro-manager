@@ -132,4 +132,92 @@ final class KeymapManagerTests: XCTestCase {
         XCTAssertThrowsError(try KeymapManager.parse(["data": "not json"]))
         XCTAssertFalse(KeymapManager.isAgentKeymapApplied([:]))
     }
+
+    // MARK: - Layouts with no slot for a binding
+
+    /// The emulator's stock keymap with its active layer's layout edited.
+    private func stockKeymap(editing edit: (inout [String: Any]) -> Void) throws -> [String: Any] {
+        var config = PadEmulator.stockKeymap()
+        var profiles = try XCTUnwrap(config["profiles"] as? [[String: Any]])
+        var layers = try XCTUnwrap(profiles[0]["layers"] as? [[String: Any]])
+        var layout = try XCTUnwrap(layers[0]["layout"] as? [String: Any])
+        edit(&layout)
+        layers[0]["layout"] = layout
+        profiles[0]["layers"] = layers
+        config["profiles"] = profiles
+        return config
+    }
+
+    /// One layout per part `withAgentKeymap` skips but `isAgentKeymapApplied`
+    /// requires: a key outside the matrix, a dial without both rotation
+    /// slots, a joystick without its north sector.
+    private func unplaceableLayouts() throws -> [(name: String, config: [String: Any])] {
+        [
+            ("a key outside the matrix", try stockKeymap { layout in
+                var keymap = layout["keymap"] as! [[String]]
+                keymap[3].removeLast()
+                layout["keymap"] = keymap
+            }),
+            ("a dial with one slot", try stockKeymap { layout in
+                layout["encoders"] = [["KC_MPLY"]]
+            }),
+            ("a joystick without north", try stockKeymap { layout in
+                var joystick = layout["joystick"] as! [String: Any]
+                var sectors = joystick["sectors"] as! [[String: Any]]
+                sectors.removeAll { $0["k"] as? String == "KI_X" }
+                joystick["sectors"] = sectors
+                layout["joystick"] = joystick
+            }),
+        ]
+    }
+
+    func testLayoutsWithoutASlotCannotBeApplied() throws {
+        for (name, config) in try unplaceableLayouts() {
+            let next = try KeymapManager.withAgentKeymap(config)
+            XCTAssertFalse(KeymapManager.isAgentKeymapApplied(next), name)
+        }
+    }
+
+    /// The fs.write calls the emulator has taken, from its traffic log.
+    private func writes(_ emulator: PadEmulator) -> Int {
+        emulator.traffic.filter { $0.hasPrefix("fs.write") }.count
+    }
+
+    /// A layout that cannot take the bindings must not cost a flash write:
+    /// it would be written again, and fail again, on every start and every
+    /// reconnect.
+    func testApplyWritesNothingWhenTheLayoutHasNoSlot() async throws {
+        for (name, config) in try unplaceableLayouts() {
+            let emulator = PadEmulator()
+            let device = WLDevice(emulator: emulator)
+            try device.connect()
+            let text = try XCTUnwrap(String(data: JSONSerialization.data(withJSONObject: config),
+                                            encoding: .utf8))
+            _ = try await device.callAsync("fs.write", params: ["file": "keymap.json", "data": text])
+            XCTAssertEqual(writes(emulator), 1, name)
+
+            do {
+                _ = try await KeymapManager.apply(device)
+                XCTFail("\(name): expected cannotApply")
+            } catch KeymapManager.Failure.cannotApply {
+            } catch {
+                XCTFail("\(name): expected cannotApply, got \(error)")
+            }
+            XCTAssertEqual(writes(emulator), 1, "\(name): apply must not write")
+            device.disconnect(reason: nil)
+        }
+    }
+
+    func testStockLayoutAppliesWithOneWrite() async throws {
+        let emulator = PadEmulator()
+        let device = WLDevice(emulator: emulator)
+        try device.connect()
+
+        let changed = try await KeymapManager.apply(device)
+        XCTAssertTrue(changed)
+        XCTAssertEqual(writes(emulator), 1)
+        let after = try await KeymapManager.read(device)
+        XCTAssertTrue(KeymapManager.isAgentKeymapApplied(after))
+        device.disconnect(reason: nil)
+    }
 }
