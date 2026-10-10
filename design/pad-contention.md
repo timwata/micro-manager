@@ -527,6 +527,28 @@ Notes:
   Input running in the background, launch → no warning; open the Inspector
   → "Also driving this pad: Micro Manager Inspector"; quit it and reopen
   the panel → warning gone.
+- **Input's focus announcements (second report on the same PR).** After the
+  fix above, opening and quitting the Inspector left "Also driving this pad:
+  input" until Recheck. A live probe (a test process holding the pad,
+  logging every reply and scan while the Inspector was opened and quit, then
+  while only the frontmost app was switched) showed a foreign reply shortly
+  after each frontmost-app change (0.27 s after the Inspector quit), Inspector or not, with a random id
+  and `"result": null`. Input sends `host.focused_app` on every app switch;
+  the probe's own `host.focused_app` got the same null back, while an empty
+  `v.oai.thstatus` got `{"ok":1}` and `sys.version` an object. The reply
+  after the Inspector quit found only Input in the scan; Input was quiet, so
+  the fallback blamed it, and the warning stayed for as long as Input runs.
+  Fix: `noteResponse(id:result:error:)` ignores a foreign reply whose result
+  is null (nil or `NSNull`) and that carries no error, after the own-id check.
+  Error replies still count. `PadEmulator` now answers `host.focused_app`
+  with `NSNull()`, as the device does.
+- Mutation checks for it, each restored afterwards: no null filter
+  (null-reply); filter before the own-id check (own-null-consumed); errors
+  ignored too (error-reply); only `NSNull` ignored, not nil (null-reply);
+  emulator answers `{"ok":1}` (emulator-null); `wire(_:)` drops the result
+  (device-reply-result).
+- Not checked on hardware after the fix: whether the warning stays down
+  through an Inspector round trip with Input running (user check).
 
 ### Done
 

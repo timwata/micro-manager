@@ -696,6 +696,13 @@ interface for as long as it runs, window or not, so a listed process is only
 someone who *could* send. The bridge warns on replies only, and uses the list
 to say who may have sent them and when they have gone.
 
+Not every foreign reply is about the lighting, either. Input sends
+`host.focused_app` on every frontmost-app change, window or not, and the
+firmware answers it with a bare `"result": null` (checked on 2026-10-10; the
+lighting calls answer `{"ok":1}`, `sys.version` an object). So a foreign reply
+with a null result is ignored. Request ids are no help in telling senders
+apart: Input's look random, while `WLDevice` counts 1…998.
+
 **Variant gating is real.** These vendor methods are registered per hardware
 variant. If `v.oai.thstatus` returns `Method not found` rather than `{"ok":1}`,
 this firmware genuinely does not have it. Older Creator Micro 2 firmware

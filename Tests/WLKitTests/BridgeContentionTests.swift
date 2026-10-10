@@ -1,6 +1,11 @@
 import XCTest
 @testable import WLKit
 
+private extension BridgeController {
+    /// A reply to a lighting call, which the firmware answers {"ok":1}.
+    func noteResponse(id: Int) { noteResponse(id: id, result: ["ok": 1], error: nil) }
+}
+
 /// The "another app is also driving this pad" warning, on the built-in
 /// virtual pad with `agent.list` stubbed out, so these run everywhere.
 ///
@@ -230,6 +235,68 @@ final class BridgeContentionTests: XCTestCase {
         bridge.scanContention()
         XCTAssertFalse(bridge.contendingClient, "the Inspector has quit")
         XCTAssertEqual(bridge.contenders, [input])
+    }
+
+    /// The second report: Input announces the frontmost app
+    /// (`host.focused_app`) on every app switch, including the one when the
+    /// Inspector quits, and the firmware answers that with a bare null. Such
+    /// a reply neither raises the warning nor scans, so it cannot blame Input
+    /// once the Inspector has gone.
+    func testANullReplyIsNotAboutTheLighting() async {
+        await startScanned(.authoritative([input]))
+        reply(while: [input, inspector])
+        XCTAssertEqual(bridge.contenders, [inspector])
+
+        scanResult = .authoritative([input])
+        let before = scans
+        bridge.noteResponse(id: foreignID, result: NSNull(), error: nil)
+        bridge.noteResponse(id: foreignID, result: nil, error: nil)
+        XCTAssertEqual(scans, before, "a null reply does not scan")
+        XCTAssertTrue(bridge.contendingClient, "nor does it clear what the Inspector raised")
+
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient)
+        bridge.noteResponse(id: foreignID, result: NSNull(), error: nil)
+        XCTAssertFalse(bridge.contendingClient, "Input's focus announcement")
+    }
+
+    /// The device's reply callback hands the result on, so the filter sees
+    /// what the pad answered.
+    func testTheDeviceReplyCarriesItsResult() async {
+        await bridge.start()
+        bridge.device.onResponse?(foreignID, NSNull(), nil)
+        XCTAssertFalse(bridge.contendingClient)
+        bridge.device.onResponse?(foreignID, ["ok": 1], nil)
+        XCTAssertTrue(bridge.contendingClient)
+    }
+
+    /// The emulator answers `host.focused_app` the way the device does.
+    func testEmulatorAnswersFocusedAppWithNull() throws {
+        let pad = PadEmulator()
+        let (result, error) = pad.handle("host.focused_app", params: ["name": "Finder", "bundle_id": "com.apple.finder"])
+        XCTAssertNil(error)
+        XCTAssertTrue(result is NSNull)
+    }
+
+    /// An error reply still counts: whoever got it is talking to the pad,
+    /// and nothing says it was not about the lighting.
+    func testAnErrorReplyStillRaises() async {
+        await startScanned(.authoritative([input]))
+        scanResult = .authoritative([input, inspector])
+        bridge.noteResponse(id: foreignID, result: nil, error: "Method not found")
+        XCTAssertTrue(bridge.contendingClient)
+        XCTAssertEqual(bridge.contenders, [inspector])
+    }
+
+    /// A null reply to one of our own calls still ends that call: had the
+    /// id stayed in flight, another client's reply under the same id would
+    /// later be taken for ours.
+    func testOurOwnNullReplyIsStillConsumed() async {
+        await bridge.start()
+        bridge.noteIssued(id: 500)
+        bridge.noteResponse(id: 500, result: NSNull(), error: nil)
+        bridge.noteResponse(id: 500)
+        XCTAssertTrue(bridge.contendingClient)
     }
 
     /// A quiet holder that starts sending is all there is to blame, and the

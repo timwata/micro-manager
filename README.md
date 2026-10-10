@@ -299,7 +299,8 @@ the warning too.
 
 Holding the pad open is not driving it, so that alone never raises the
 warning. Work Louder's Input app keeps the pad open while it runs in the
-background, and some apps (input remappers, macro or streaming tools) open
+background, and tells the pad which app is in front on every app switch; the
+manager ignores those messages, since they leave the lighting alone. Some apps (input remappers, macro or streaming tools) open
 every HID device without ever touching the lighting. The manager remembers
 the apps that were holding the pad quietly, and blames a reply on an app that
 arrived since. If one of the quiet apps starts sending, the warning names all

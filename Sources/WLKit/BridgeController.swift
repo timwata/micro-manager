@@ -210,8 +210,8 @@ public final class BridgeController: ObservableObject {
         device.onTX = { [weak self] _, _, id in
             self?.noteIssued(id: id)
         }
-        device.onResponse = { [weak self] id, _, _ in
-            self?.noteResponse(id: id)
+        device.onResponse = { [weak self] id, result, error in
+            self?.noteResponse(id: id, result: result, error: error)
         }
         device.onNotification = { [weak self] method, params in
             guard let self, method == OAI.notifyHID else { return }
@@ -228,9 +228,14 @@ public final class BridgeController: ObservableObject {
 
     /// Every reply the pad sends, ours or not. Internal so tests can land a
     /// reply id the bridge never issued, as another client's would.
-    func noteResponse(id: Int) {
+    func noteResponse(id: Int, result: Any?, error: String?) {
         // A reply to an id we never sent came from another client.
         guard issuedIDs.remove(id) == nil else { return }
+        // Not every call is about the lighting. Input announces the frontmost
+        // app (`host.focused_app`) on every app switch, and the firmware
+        // answers that with a bare null; lighting calls are answered
+        // {"ok":1}. A null reply cannot be a fight over the colours.
+        guard error != nil || !(result == nil || result is NSNull) else { return }
         // Scan to see who may have sent it, at most once a second. A reply
         // within the window still raises the warning; it is laid at the
         // clients of the last scan.
