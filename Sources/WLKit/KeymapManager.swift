@@ -53,12 +53,18 @@ public enum KeymapManager {
 
     public enum Failure: LocalizedError {
         case noProfiles
+        /// The layout has no slot for some binding. What has a slot is bound;
+        /// the rest stays unbound until the layout is fixed.
+        case cannotApply
+        /// The write went out, and the keymap read back still lacks a binding.
         case notAccepted
         case unreadable(String)
 
         public var errorDescription: String? {
             switch self {
             case .noProfiles: return "Device keymap has no profiles."
+            case .cannotApply:
+                return "The device keymap's layout lacks a slot for at least one agent binding, so those controls stay unbound. Put the keys, the dial and the joystick back to their default positions in Work Louder's Input app."
             case .notAccepted: return "The device did not accept the agent keymap."
             case .unreadable(let detail): return "Could not read the device keymap: \(detail)"
             }
@@ -203,20 +209,39 @@ public enum KeymapManager {
     }
 
     /// Returns true when it had to change something.
+    ///
+    /// `withAgentKeymap` skips what it cannot place (a key outside the
+    /// matrix, a dial with fewer than two slots, a joystick missing a
+    /// cardinal sector), while `isAgentKeymapApplied` requires all of it.
+    /// Such a layout still gets what can be bound, since every placed key
+    /// lights, but it is written at most once: after that write
+    /// `withAgentKeymap(config)` equals `config`, so later starts and
+    /// reconnects find nothing to write and only throw `cannotApply` again.
+    /// Without that check each of them would cost a flash write.
     @discardableResult
     public static func apply(_ device: WLDevice) async throws -> Bool {
         let config = try await read(device)
         if isAgentKeymapApplied(config) { return false }
 
         let next = try withAgentKeymap(config)
-        let encoded = try JSONSerialization.data(withJSONObject: next)
-        guard let text = String(data: encoded, encoding: .utf8) else {
-            throw Failure.unreadable("could not encode keymap")
+        guard isAgentKeymapApplied(next) else {
+            if !(next as NSDictionary).isEqual(to: config) {
+                try await write(next, to: device)
+            }
+            throw Failure.cannotApply
         }
-        _ = try await device.callAsync("fs.write", params: ["file": "keymap.json", "data": text])
+        try await write(next, to: device)
 
         let after = try await read(device)
         guard isAgentKeymapApplied(after) else { throw Failure.notAccepted }
         return true
+    }
+
+    private static func write(_ config: [String: Any], to device: WLDevice) async throws {
+        let encoded = try JSONSerialization.data(withJSONObject: config)
+        guard let text = String(data: encoded, encoding: .utf8) else {
+            throw Failure.unreadable("could not encode keymap")
+        }
+        _ = try await device.callAsync("fs.write", params: ["file": "keymap.json", "data": text])
     }
 }

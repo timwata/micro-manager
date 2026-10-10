@@ -1,6 +1,6 @@
 # Fix plan: follow-up review of `main` (2026-10-10)
 
-Status: Phase 1 implemented; Phase 2 planned.
+Status: Phases 1 and 2 implemented.
 
 Source: a whole-repo review of `main` at `b303213` (after all six PRs of
 `design/review-fixes.md` were merged). Build and tests were green at that
@@ -172,20 +172,33 @@ edited in Work Louder's Input app could be.
 
 **Fix:** decide before writing. In `apply`, compute
 `next = try withAgentKeymap(config)`. If `isAgentKeymapApplied(next)` is
-false, throw a new `Failure.cannotApply` **without** calling `fs.write`. Its
-message says that the device keymap's layout has no slot for every agent
-binding, so nothing was written, and that the keys, the dial and the
-joystick need their default positions back in Input. Keep `notAccepted` for
-a write the firmware did not take.
+false, write `next` only if it differs from `config`, then throw a new
+`Failure.cannotApply`. That binds every key, dial and joystick slot that
+exists (those keys light, which they did before this fix too) in one
+write: after it, `withAgentKeymap(config)` equals `config`, so later starts
+and reconnects write nothing and throw `cannotApply` again. The message
+says that the device keymap's layout lacks a slot for at least one agent
+binding, so those controls stay unbound, and that the keys, the dial and
+the joystick need their default positions back in Input. Keep
+`notAccepted` for a full write the firmware did not take.
+
+*Revised after PR review.* The first version threw `cannotApply` without
+any write. That left a fresh pad with such a layout entirely dark, on its
+stock F-keys, where the old code had at least bound and lit what had a
+slot.
 
 **Tests** (`KeymapManagerTests`):
 
 - Pure: for each of the three layouts above (built from
   `PadEmulator.stockKeymap()` with one part removed),
   `isAgentKeymapApplied(withAgentKeymap(config))` is false.
+- Pure: a config already rewritten once (and round-tripped through
+  `JSONSerialization`, as a read would return it) is `NSDictionary`-equal to
+  its own rewrite, and the stock one is not.
 - Device: on a `WLDevice` with a `PadEmulator`, write such a layout with
-  `fs.write`, then call `KeymapManager.apply`. It throws `.cannotApply`, and
-  the emulator saw no `fs.write` after the test's own. Count the writes with
+  `fs.write`, then call `KeymapManager.apply` twice. Each call throws
+  `.cannotApply`; the emulator saw one `fs.write` after the test's own, and
+  every binding that has a slot is bound. Count the writes with
   whatever the emulator exposes (its traffic log); if it exposes nothing
   suitable, add a small internal counter to `PadEmulator`, and keep it
   faithful to the firmware (the counter must not change any reply).
@@ -308,24 +321,76 @@ Notes:
 
 Branch `fix/followup-2-device-hygiene` · PR title `fix: no futile keymap writes, close the hid manager on failure`
 
-- [ ] F3: `KeymapManager.Failure.cannotApply` with an actionable message.
-- [ ] F3: `apply` checks `isAgentKeymapApplied(withAgentKeymap(config))`
-      before writing, and throws `.cannotApply` without `fs.write`.
-- [ ] F3 tests: three pure layout cases; the emulator case (no `fs.write`
-      after the test's own); the stock layout still writes exactly once.
-- [ ] F3: if `PadEmulator` gained a counter, it changes no reply (the
+- [x] F3: `KeymapManager.Failure.cannotApply` with an actionable message.
+- [x] F3: `apply` checks `isAgentKeymapApplied(withAgentKeymap(config))`
+      before writing; if false, it writes the partial binding only when it
+      changes the config, and throws `.cannotApply`.
+- [x] F3 tests: three pure layout cases; the equality check on a partially
+      bound config; the emulator case (two `apply` calls, one `fs.write`
+      after the test's own, placeable bindings bound); the stock layout
+      still writes exactly once.
+- [x] F3: if `PadEmulator` gained a counter, it changes no reply (the
       emulator stays faithful to the firmware); say so in Notes.
-- [ ] F4: `WLDevice.closeManager()`; called on every failed `connect()` and
+- [x] F4: `WLDevice.closeManager()`; called on every failed `connect()` and
       from `disconnect(reason:)` even when no device is open.
 - [ ] F4 **verify** (needs a pad you can unplug, else a user check): with
       the bridge off and the pad unplugged, plug it in; `ioreg -r -n
       "Creator Micro 2" -l -w0 | grep IOUserClientCreator` lists no client
       created by the app. Before the fix, record whether it did.
-- [ ] `LiveDeviceTests` still pass with a pad, or skip without one.
-- [ ] `swift build -c release` (zero warnings) and
+      *Not done in the session: user check (see Notes).*
+- [x] `LiveDeviceTests` still pass with a pad, or skip without one.
+- [x] `swift build -c release` (zero warnings) and
       `env -u HERDR_SOCKET_PATH swift test` green.
 
 Notes:
+
+- **No emulator counter.** `PadEmulator.traffic` already logs one
+  `fs.write keymap.json …` line per accepted write, so the tests count
+  those lines. `PadEmulator` is unchanged.
+- **Test layouts.** Built from `PadEmulator.stockKeymap()` as planned: the
+  last key of row 3 removed (a bound key outside the matrix), `encoders`
+  set to `[["KC_MPLY"]]`, and the north sector (`KI_X`) removed from the
+  joystick. The device test writes each one with its own `fs.write` on a
+  fresh emulator, then calls `apply` twice and expects `.cannotApply`
+  both times, two writes in all, and `PadEmulator.bound` equal to every
+  AG id except the ones without a slot (key 12; dial 13 and 14; joystick
+  north 15).
+- **Partial write (PR review M1).** The PR first shipped "no write at all"
+  for these layouts. Review pointed out that this left a fresh pad dark,
+  where the old code bound and lit what had a slot, so `apply` now writes
+  the partial binding once. "Once" rests on `NSDictionary.isEqual(to:)`
+  between the read config (Foundation types) and its rewrite (Swift
+  arrays and dictionaries); a pure test pins that it sees an already
+  partially bound config as unchanged, so re-serialised JSON was not
+  needed. The rewrite goes through a shared `write(_:to:)` helper.
+- **`disconnect(reason:)` without a device.** With `connect()` closing the
+  manager on every throw, the no-device branch should never find one
+  open. It closes it anyway, as the plan says, so the guarantee does not
+  rest on every `connect()` path. `connect()` starts with
+  `disconnect(reason: nil)`, so a reconnect also closes any stray one.
+- **Mutation checks.** Each restored afterwards:
+  - No `cannotApply` guard in `apply`: the emulator test fails for all
+    three layouts (`notAccepted` instead of `cannotApply`, and 3 writes
+    instead of 2 after the second `apply`).
+  - Partial write without the equality check (always written): the
+    emulator test fails for all three layouts on the second `apply` (3
+    writes instead of 2).
+  - No partial write (the PR's first version): the emulator test fails
+    for all three layouts (1 write instead of 2, nothing bound).
+  - Guard inverted: the stock test fails (`cannotApply` on a layout that
+    can take the bindings).
+  - A second `fs.write` in `apply`: the stock test fails (2 writes).
+  - The dial check dropped from `isAgentKeymapApplied`: the pure test
+    fails for "a dial with one slot".
+- **F4 verify not done.** The session had the pad on USB but nobody to
+  unplug it, so neither the before nor the after `ioreg` result is
+  recorded. It is listed as a user check in the PR. F4 has no automated
+  test (it needs a real IOKit device and a missing pad).
+- **`LiveDeviceTests`** ran against the real pad (USB) and passed, which
+  covers the success path of the changed `connect()`. The installed app
+  was running and holding the pad at the time.
+- Full suite: 201 tests, 0 failures, 2 skipped. Release build in a clean
+  `--build-path`: zero warnings.
 
 ### Done
 

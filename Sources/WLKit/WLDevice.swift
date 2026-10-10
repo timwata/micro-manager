@@ -158,6 +158,7 @@ public final class WLDevice {
         IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
 
         guard let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>, !set.isEmpty else {
+            closeManager()
             throw Failure.notFound
         }
         // Over Bluetooth the pad is a single IOHIDDevice whose primary usage is
@@ -168,11 +169,15 @@ public final class WLDevice {
         guard let dev = set.first(where: { primaryUsagePage($0) == WLDevice.vendorUsagePage })
             ?? set.first(where: { hasVendorCollection($0) })
         else {
+            closeManager()
             throw Failure.noVendorCollection
         }
 
         let result = IOHIDDeviceOpen(dev, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard result == kIOReturnSuccess else { throw Failure.openFailed(result) }
+        guard result == kIOReturnSuccess else {
+            closeManager()
+            throw Failure.openFailed(result)
+        }
 
         device = dev
         info = Info(
@@ -212,20 +217,33 @@ public final class WLDevice {
             if let reason { onDisconnect?(reason) }
             return
         }
-        guard let dev = device else { return }
+        guard let dev = device else {
+            // No device, but maybe a manager: `connect()` closes it on every
+            // throw, and this keeps that true without relying on it. An open
+            // manager opens a matching pad that is plugged in later, so this
+            // process would hold the pad while the bridge is off.
+            closeManager()
+            return
+        }
         IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
         device = nil
-        if let mgr = manager {
-            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
-            manager = nil
-        }
+        closeManager()
         info = nil
         rpcAccumulator = ""
         debugAccumulator = ""
         for (_, done) in pending { done(nil, "disconnected") }
         pending.removeAll()
         if let reason { onDisconnect?(reason) }
+    }
+
+    /// Closes and drops the manager. `connect()` opens it before it knows
+    /// there is a pad, so a failed connect must close it too, not only a
+    /// disconnect from an open device.
+    private func closeManager() {
+        guard let mgr = manager else { return }
+        IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+        manager = nil
     }
 
     // MARK: - Send
