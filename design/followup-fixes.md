@@ -172,20 +172,33 @@ edited in Work Louder's Input app could be.
 
 **Fix:** decide before writing. In `apply`, compute
 `next = try withAgentKeymap(config)`. If `isAgentKeymapApplied(next)` is
-false, throw a new `Failure.cannotApply` **without** calling `fs.write`. Its
-message says that the device keymap's layout has no slot for every agent
-binding, so nothing was written, and that the keys, the dial and the
-joystick need their default positions back in Input. Keep `notAccepted` for
-a write the firmware did not take.
+false, write `next` only if it differs from `config`, then throw a new
+`Failure.cannotApply`. That binds every key, dial and joystick slot that
+exists (those keys light, which they did before this fix too) in one
+write: after it, `withAgentKeymap(config)` equals `config`, so later starts
+and reconnects write nothing and throw `cannotApply` again. The message
+says that the device keymap's layout lacks a slot for at least one agent
+binding, so those controls stay unbound, and that the keys, the dial and
+the joystick need their default positions back in Input. Keep
+`notAccepted` for a full write the firmware did not take.
+
+*Revised after PR review.* The first version threw `cannotApply` without
+any write. That left a fresh pad with such a layout entirely dark, on its
+stock F-keys, where the old code had at least bound and lit what had a
+slot.
 
 **Tests** (`KeymapManagerTests`):
 
 - Pure: for each of the three layouts above (built from
   `PadEmulator.stockKeymap()` with one part removed),
   `isAgentKeymapApplied(withAgentKeymap(config))` is false.
+- Pure: a config already rewritten once (and round-tripped through
+  `JSONSerialization`, as a read would return it) is `NSDictionary`-equal to
+  its own rewrite, and the stock one is not.
 - Device: on a `WLDevice` with a `PadEmulator`, write such a layout with
-  `fs.write`, then call `KeymapManager.apply`. It throws `.cannotApply`, and
-  the emulator saw no `fs.write` after the test's own. Count the writes with
+  `fs.write`, then call `KeymapManager.apply` twice. Each call throws
+  `.cannotApply`; the emulator saw one `fs.write` after the test's own, and
+  every binding that has a slot is bound. Count the writes with
   whatever the emulator exposes (its traffic log); if it exposes nothing
   suitable, add a small internal counter to `PadEmulator`, and keep it
   faithful to the firmware (the counter must not change any reply).
@@ -310,9 +323,12 @@ Branch `fix/followup-2-device-hygiene` · PR title `fix: no futile keymap writes
 
 - [x] F3: `KeymapManager.Failure.cannotApply` with an actionable message.
 - [x] F3: `apply` checks `isAgentKeymapApplied(withAgentKeymap(config))`
-      before writing, and throws `.cannotApply` without `fs.write`.
-- [x] F3 tests: three pure layout cases; the emulator case (no `fs.write`
-      after the test's own); the stock layout still writes exactly once.
+      before writing; if false, it writes the partial binding only when it
+      changes the config, and throws `.cannotApply`.
+- [x] F3 tests: three pure layout cases; the equality check on a partially
+      bound config; the emulator case (two `apply` calls, one `fs.write`
+      after the test's own, placeable bindings bound); the stock layout
+      still writes exactly once.
 - [x] F3: if `PadEmulator` gained a counter, it changes no reply (the
       emulator stays faithful to the firmware); say so in Notes.
 - [x] F4: `WLDevice.closeManager()`; called on every failed `connect()` and
@@ -335,7 +351,18 @@ Notes:
   last key of row 3 removed (a bound key outside the matrix), `encoders`
   set to `[["KC_MPLY"]]`, and the north sector (`KI_X`) removed from the
   joystick. The device test writes each one with its own `fs.write` on a
-  fresh emulator, then expects `.cannotApply` and still one write.
+  fresh emulator, then calls `apply` twice and expects `.cannotApply`
+  both times, two writes in all, and `PadEmulator.bound` equal to every
+  AG id except the ones without a slot (key 12; dial 13 and 14; joystick
+  north 15).
+- **Partial write (PR review M1).** The PR first shipped "no write at all"
+  for these layouts. Review pointed out that this left a fresh pad dark,
+  where the old code bound and lit what had a slot, so `apply` now writes
+  the partial binding once. "Once" rests on `NSDictionary.isEqual(to:)`
+  between the read config (Foundation types) and its rewrite (Swift
+  arrays and dictionaries); a pure test pins that it sees an already
+  partially bound config as unchanged, so re-serialised JSON was not
+  needed. The rewrite goes through a shared `write(_:to:)` helper.
 - **`disconnect(reason:)` without a device.** With `connect()` closing the
   manager on every throw, the no-device branch should never find one
   open. It closes it anyway, as the plan says, so the guarantee does not
@@ -343,8 +370,13 @@ Notes:
   `disconnect(reason: nil)`, so a reconnect also closes any stray one.
 - **Mutation checks.** Each restored afterwards:
   - No `cannotApply` guard in `apply`: the emulator test fails for all
-    three layouts (`notAccepted` instead of `cannotApply`, and 2 writes
-    instead of 1).
+    three layouts (`notAccepted` instead of `cannotApply`, and 3 writes
+    instead of 2 after the second `apply`).
+  - Partial write without the equality check (always written): the
+    emulator test fails for all three layouts on the second `apply` (3
+    writes instead of 2).
+  - No partial write (the PR's first version): the emulator test fails
+    for all three layouts (1 write instead of 2, nothing bound).
   - Guard inverted: the stock test fails (`cannotApply` on a layout that
     can take the bindings).
   - A second `fs.write` in `apply`: the stock test fails (2 writes).
@@ -357,7 +389,7 @@ Notes:
 - **`LiveDeviceTests`** ran against the real pad (USB) and passed, which
   covers the success path of the changed `connect()`. The installed app
   was running and holding the pad at the time.
-- Full suite: 200 tests, 0 failures, 2 skipped. Release build in a clean
+- Full suite: 201 tests, 0 failures, 2 skipped. Release build in a clean
   `--build-path`: zero warnings.
 
 ### Done
