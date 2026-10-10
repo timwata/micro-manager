@@ -1,6 +1,6 @@
 # Pad contention: a warning that can clear
 
-Status: Phases 1 and 2 implemented.
+Status: Phases 1–3 implemented.
 
 The panel warns "Another app is also driving this pad — colours may fight."
 when something else talks to the pad. Once raised, the warning stays until
@@ -181,9 +181,25 @@ State, in `BridgeController`:
 |---|---|---|---|
 | `.unavailable` | — | `trafficSeen` | none (Phase 1 behaviour) |
 | `.authoritative` | empty | false | cleared: whoever sent it is gone |
-| `.authoritative` | some | true | none |
+| `.authoritative` | some | true, unless all acknowledged | none |
 | `.advisory` | empty | false | cleared |
 | `.advisory` | some | `trafficSeen` | none: the list labels, it cannot raise |
+
+Acknowledged clients (added after PR #20's review): `recheckContention()`
+records the pids of the `.authoritative` others it finds in a private
+`acknowledgedPIDs: Set<pid_t>`, and only others outside that set raise the
+warning. Without it, an app that opens every HID device (an input remapper,
+a macro or streaming tool) but never sends would raise the warning on every
+scan, and nothing short of quitting it would clear it: Recheck rescans and
+finds it again, and so does an off/on toggle. Acknowledged clients:
+
+- are still listed in `contenders`, so they are named if the warning comes
+  up for another reason;
+- still raise it through `trafficSeen` when they send;
+- drop out of the set when a scan (`.authoritative` or `.advisory`) no
+  longer lists them, so a relaunched app raises the warning again;
+  `.unavailable` keeps the set, since it says nothing about who left;
+- are forgotten by `start()` and `stop()` (`resetContention()`).
 
 Scans run:
 
@@ -191,8 +207,9 @@ Scans run:
   `didBecomeKeyNotification` hooks in `MenuPanelView`, which already call
   `reloadRemotes()`, also call a new `bridge.scanContention()` (scan only,
   no repaint);
-- from **Recheck**: `recheckContention()` clears `trafficSeen`, scans, then
-  repaints as in Phase 1;
+- from **Recheck**: `recheckContention()` clears `trafficSeen`, scans,
+  acknowledges the `.authoritative` others it found, then repaints as in
+  Phase 1;
 - after a foreign reply, to put a name on it: at most one scan per second,
   so a chatty client cannot turn every reply into a registry walk;
 - after the device (re)opens in `openDevice()`.
@@ -378,33 +395,95 @@ Notes:
 
 Branch `feat/contention-3-active-check` · PR title `feat: clear the "another app" warning once the other app is gone`
 
-- [ ] Phase 2's gate in Notes says go (or Part 1 was adjusted first).
-- [ ] `trafficSeen`, `contenders`, `updateContention()` and the table in
+- [x] Phase 2's gate in Notes says go (or Part 1 was adjusted first).
+- [x] `trafficSeen`, `contenders`, `updateContention()` and the table in
       Part 1; `contendingClient` stays the flag the panel reads.
-- [ ] `scanClients` seam; `scanContention()` (scan only) and
+- [x] `scanClients` seam; `scanContention()` (scan only) and
       `recheckContention()` (clear traffic, scan, repaint).
-- [ ] Scans on panel open (both existing hooks), on **Recheck**, after a
+- [x] Scans on panel open (both existing hooks), on **Recheck**, after a
       foreign reply (at most once a second) and after `openDevice()`
       succeeds.
-- [ ] Panel copy with names, as in Part 1; **Recheck** kept.
-- [ ] Tests (`BridgeContentionTests`, with the `scanClients` seam): every row
+- [x] Panel copy with names, as in Part 1; **Recheck** kept.
+- [x] Tests (`BridgeContentionTests`, with the `scanClients` seam): every row
       of the table; the one-per-second limit on reply-triggered scans; a
       recheck that finds an authoritative empty list clears traffic seen
       earlier; `.unavailable` behaves exactly as Phase 1.
-- [ ] Each test mutation-checked.
-- [ ] `README.md` "Only one bridge at a time": the panel names the other
+- [x] Each test mutation-checked.
+- [x] `README.md` "Only one bridge at a time": the panel names the other
       app, and the warning clears by itself when the panel next opens after
       that app has quit (USB). Explain the Bluetooth caveat if Phase 2 found
       one.
-- [ ] `CLAUDE.md`: the "Only one HID client at a time" bullet describes
+- [x] `CLAUDE.md`: the "Only one HID client at a time" bullet describes
       both signals (reply ids, registry scan) and the table's rule.
 - [ ] User checks listed in the PR: Inspector open → named warning; quit it,
       reopen the panel → warning gone without pressing anything; same with
       Input or Codex if installed.
-- [ ] `swift build -c release` (zero warnings) and
+- [x] `swift build -c release` (zero warnings) and
       `env -u HERDR_SOCKET_PATH swift test` green.
 
 Notes:
+
+- The table's "effect on `trafficSeen`" column is applied only when a scan
+  runs (`applyScan()`), not on every recompute. `updateContention()` is then
+  `trafficSeen || (authoritative && !others.isEmpty)` for the flag, which
+  gives every row of the table at scan time and keeps a reply that lands
+  *after* an empty scan raising the warning. Clearing on every recompute
+  would let a stale `.authoritative([])` swallow each later foreign reply
+  that falls inside the reply-scan window.
+- The one-per-second limit counts reply-triggered scans only, on a
+  monotonic clock (`ProcessInfo.systemUptime`, behind the `uptime` seam).
+  Panel, Recheck and open scans neither count towards it nor are held by
+  it. A reply inside the window still raises the warning (it sets
+  `trafficSeen`); it just keeps the names from the last scan. There is no
+  trailing scan at the end of the window: a chatty client is named by the
+  first scan anyway, and the panel rescans whenever it opens.
+- Scans only reach the registry while running with the device connected;
+  otherwise they are `.unavailable` without calling `scanClients`, so an off
+  bridge never shows the warning (Phase 1's rule). `start()` and `stop()`
+  reset both signals and the reply-scan clock.
+- Beyond the plan: an unplug (`device.onDisconnect`) drops the last scan to
+  `.unavailable`, since who held a pad that has gone says nothing; the
+  reopen scans afresh. Tested by unplugging the virtual pad, which needed
+  `device` to become `private(set)` (internal read) instead of `private`.
+- `scanClients` is a `lazy var` so its default can capture `self` weakly
+  and read `device` at call time.
+- **Recheck**'s help text now reads "Check again for other apps and repaint
+  the pad. The warning comes back if the other app is still there." —
+  Phase 1's text ("It comes back if the other app sends to the pad again")
+  no longer described what it does.
+- Mutation checks, each restored afterwards (the failing tests in
+  brackets): an empty scan keeps `trafficSeen` (authoritative-empty,
+  advisory-empty); authoritative others ignored (authoritative-others,
+  open, recheck, off); advisory others raise (advisory-others); no reply
+  scan limit (limit); replies never scan (names-the-sender, limit); an off
+  bridge scans (off); `openDevice()` does not scan (open, advisory-others,
+  off, limit); Recheck does not scan (recheck); `stop()` keeps the last scan
+  (off); an unavailable scan clears `trafficSeen` (unavailable, emulator
+  and the Phase 1 tests); panel scans count towards the limit (limit);
+  `.unavailable` keeps the old names (off); an unplug keeps the scan
+  (unplug).
+- No hardware or UI check was done in-session; the named warning and the
+  clear-on-reopen round trip are user checks in the PR. Bluetooth remains
+  unverified (Phase 2 Notes).
+- Review follow-up (PR #20): an app that holds the vendor interface but never
+  sends made the warning permanent, since every scan (Recheck's and the
+  reopen's included) found it again. Not verified on hardware: it follows
+  from IOKit matching, where a manager with nil or broad matching opens the
+  0xFF00 interface like any other. Fixed by letting Recheck acknowledge the
+  clients it finds (`acknowledgedPIDs`, Part 1). Recheck's help text now
+  reads "Check again for other apps, accept the ones still holding the pad,
+  and repaint it. The warning comes back if one of them sends to the pad, or
+  another app opens it." `testRecheckScans` changed accordingly: a Recheck
+  that still finds the Inspector now clears the warning.
+- Mutation checks for the follow-up, each restored afterwards: Recheck does
+  not acknowledge (recheck, passive holder, unacknowledged, acknowledged
+  reply, unavailable keeps, stop forgets); no pruning (quit app forgotten);
+  `.unavailable` clears the set (unavailable keeps); `resetContention()`
+  keeps the set (stop forgets); the set ignored when raising (as "does not
+  acknowledge"); every other acknowledged, i.e. authoritative others never
+  raise (authoritative-others, open, unplug, off, passive holder,
+  unacknowledged, quit app forgotten, stop forgets); an acknowledged client
+  hides `trafficSeen` (acknowledged reply).
 
 ### Done
 

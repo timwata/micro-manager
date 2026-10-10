@@ -40,17 +40,14 @@ struct MenuPanelView: View {
             if bridge.contendingClient {
                 Divider()
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Label(
-                        "Another app is also driving this pad — colours may fight.",
-                        systemImage: "exclamationmark.triangle"
-                    )
+                    Label(contentionText, systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                     Button("Recheck") { Task { await bridge.recheckContention() } }
                         .controlSize(.small)
-                        .help("Clear the warning. It comes back if the other app sends to the pad again.")
+                        .help("Check again for other apps, accept the ones still holding the pad, and repaint it. The warning comes back if one of them sends to the pad, or another app opens it.")
                 }
                 .padding(.horizontal, 14).padding(.vertical, 8)
             }
@@ -63,13 +60,25 @@ struct MenuPanelView: View {
         // relaunch. The window may be kept alive between openings, in which
         // case only becoming key marks a new one — this panel's window, not
         // the emulator or any other window of the app, which would re-read
-        // the config (and maybe restart a tunnel) for no reason.
-        .onAppear { reloadRemotes() }
+        // the config (and maybe restart a tunnel) for no reason. Who else
+        // holds the pad is re-read with it, so the warning clears by itself
+        // once the other app has quit.
+        .onAppear { reloadRemotes(); bridge.scanContention() }
         .background(WindowReader { panel.window = $0 })
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
             guard let window = note.object as? NSWindow, window === panel.window else { return }
             reloadRemotes()
+            bridge.scanContention()
         }
+    }
+
+    /// Names the other apps when the registry scan knew them.
+    private var contentionText: String {
+        guard !bridge.contenders.isEmpty else {
+            return "Another app is also driving this pad — colours may fight."
+        }
+        let names = bridge.contenders.map(\.name).joined(separator: ", ")
+        return "Also driving this pad: \(names) — colours may fight."
     }
 
     // MARK: - Header
