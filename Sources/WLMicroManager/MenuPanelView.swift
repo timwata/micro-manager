@@ -229,13 +229,22 @@ struct MenuPanelView: View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(Array(Pad.displayRows.enumerated()), id: \.offset) { _, row in
                 HStack(spacing: 6) {
-                    ForEach(row, id: \.self) { key in keyView(key) }
+                    ForEach(Array(row.enumerated()), id: \.offset) { _, key in
+                        if let key {
+                            keyView(key)
+                        } else {
+                            Color.clear.frame(width: Self.keyW, height: Self.keyH)
+                        }
+                    }
                     Spacer(minLength: 0)
                 }
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
     }
+
+    private static let keyW: CGFloat = 34
+    private static let keyH: CGFloat = 26
 
     private func keyView(_ index: Int) -> some View {
         let color = bridge.keyColors[index]
@@ -247,8 +256,8 @@ struct MenuPanelView: View {
         let isUnavailable = bridge.isRemote && (isStackKey || isLandKey)
         let macroText = bridge.keyBindings.text(for: index)
         let isVoiceKey = macroText == nil && Pad.voiceKeyIDs.contains(index)
-        // Key index and agent slot are different orderings — the top row is
-        // wired right to left — so the slot lookup goes through the pad map.
+        // Only some keys are agent keys, so the slot lookup goes through the
+        // pad map.
         let slot = Pad.agentSlot(for: index)
         let agent = slot.flatMap { $0 < bridge.agents.count ? bridge.agents[$0] : nil }
 
@@ -269,7 +278,7 @@ struct MenuPanelView: View {
         } label: {
             RoundedRectangle(cornerRadius: 5)
                 .fill(color ?? Color.secondary.opacity(isBound ? 0.16 : 0.07))
-                .frame(width: 34, height: 26)
+                .frame(width: Self.keyW, height: Self.keyH)
                 .overlay(
                     RoundedRectangle(cornerRadius: 5)
                         .strokeBorder(Color.secondary.opacity(0.25), lineWidth: 0.5)
