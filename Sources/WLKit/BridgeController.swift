@@ -159,7 +159,7 @@ public final class BridgeController: ObservableObject {
             if self.isRunning { self.scheduleReopen() }
         }
         device.onTX = { [weak self] _, _, id in
-            self?.issuedIDs.insert(id)
+            self?.noteIssued(id: id)
         }
         device.onResponse = { [weak self] id, _, _ in
             self?.noteResponse(id: id)
@@ -172,6 +172,10 @@ public final class BridgeController: ObservableObject {
             self.handleKeyPress(index)
         }
     }
+
+    /// Every call the bridge sends. Internal so tests can put an id in flight
+    /// without racing the emulator's reply hop.
+    func noteIssued(id: Int) { issuedIDs.insert(id) }
 
     /// Every reply the pad sends, ours or not. Internal so tests can land a
     /// reply id the bridge never issued, as another client's would.

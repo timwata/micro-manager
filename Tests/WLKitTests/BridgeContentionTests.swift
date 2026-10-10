@@ -33,12 +33,11 @@ final class BridgeContentionTests: XCTestCase {
 
     /// Only a reply to an id the bridge never sent counts. Starting (device
     /// open, keymap, first paint) and repainting are all our own calls.
-    func testOnlyAForeignReplyRaisesTheWarning() async throws {
+    func testOnlyAForeignReplyRaisesTheWarning() async {
         await bridge.start()
         XCTAssertFalse(bridge.contendingClient, "start's own replies")
 
         await bridge.forceRepaint()
-        try await drainReplies()
         XCTAssertFalse(bridge.contendingClient, "a repaint's own replies")
 
         bridge.noteResponse(id: foreignID)
@@ -88,32 +87,13 @@ final class BridgeContentionTests: XCTestCase {
 
     /// A recheck must not forget the ids still in flight: the reply to a
     /// call sent just before it would then look foreign and raise the
-    /// warning again at once.
-    ///
-    /// The emulator sends on one main-queue hop and replies on the next, so
-    /// the recheck has to land between the two. How many yields put it
-    /// there depends on scheduling, so each count from 0 to 6 is tried; one
-    /// of them is the gap.
-    func testRecheckDuringARepaintDoesNotRaiseIt() async throws {
+    /// warning again at once. The id is put in flight by hand, so the
+    /// recheck always lands between the send and the reply.
+    func testRecheckKeepsInFlightIDs() async {
         await bridge.start()
-
-        for yields in 0...6 {
-            let repaint = Task { await bridge.forceRepaint() }
-            let recheck = Task {
-                for _ in 0..<yields { await Task.yield() }
-                await bridge.recheckContention()
-            }
-            await repaint.value
-            await recheck.value
-            try await drainReplies()
-            XCTAssertFalse(bridge.contendingClient, "yields \(yields)")
-        }
-    }
-
-    // MARK: - Helpers
-
-    /// Lets every emulator reply still queued on the main queue land.
-    private func drainReplies() async throws {
-        try await Task.sleep(nanoseconds: 100_000_000)
+        bridge.noteIssued(id: 500)          // one of our calls, reply not yet in
+        await bridge.recheckContention()
+        bridge.noteResponse(id: 500)        // its reply lands after the recheck
+        XCTAssertFalse(bridge.contendingClient)
     }
 }

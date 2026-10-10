@@ -233,9 +233,9 @@ Branch `feat/contention-1-recheck` · PR title `feat: recheck the "another app" 
   - [x] `recheckContention()` clears it, and a foreign id afterwards sets it
         again;
   - [x] `stop()` clears it;
-  - [x] a recheck while a repaint is in flight does not re-raise it (gate
-        the repaint's device call or start the recheck before the emulator's
-        reply hop, then let it finish and check the flag).
+  - [x] a recheck while one of our calls is in flight does not re-raise
+        it (put the id in flight with `noteIssued(id:)`, recheck, then land
+        its reply and check the flag).
 - [x] Each test mutation-checked (for example: clear `issuedIDs` in the
       recheck and watch the last test fail).
 - [x] `README.md` "Only one bridge at a time": the warning stays until the
@@ -256,15 +256,14 @@ Notes:
   another client's reply landing among them would otherwise leave the
   warning up on an off bridge.
 - A recheck while off only clears the flag; there is nothing to repaint.
-- The in-flight test cannot gate the emulator's device call without a new
-  seam, so it starts a repaint and a recheck as two main-actor tasks and
-  puts 0–6 yields in front of the recheck, one bridge for all counts. With
-  the mutation (recheck clears `issuedIDs`), 1 or 2 of the counts land in
-  the gap between the emulator's send hop and its reply hop (which ones
-  varies with scheduling: seen 3+4, 1+4, 4), and the test fails; without
-  it, all pass.
+- The in-flight test puts an id in flight through the internal
+  `noteIssued(id:)` seam (which `onTX` now calls, mirroring
+  `noteResponse(id:)`), rechecks, then lands that id's reply. An earlier
+  version raced a repaint against a recheck behind 0–6 yields; it caught
+  the mutation only about half the time (found in review), so it was
+  replaced.
 - Mutation checks, each restored afterwards: recheck clears `issuedIDs` →
-  the in-flight test fails (3 runs, every one failed); recheck leaves the
+  the in-flight test fails (5 runs, every one failed); recheck leaves the
   flag set → the recheck and stop tests fail; recheck skips the repaint →
   the recheck test fails ("the recheck repainted the key"); `stop()` keeps
   the flag → the stop test fails; every reply counts as foreign → the
