@@ -675,6 +675,22 @@ applications' responses. A response carrying an id you never issued is a
 reliable tell that something else is driving the pad — Work Louder's Input app
 and the Codex desktop app both do.
 
+That tell is passive: a client that has the pad open but is quiet goes unseen.
+To ask actively, read the IORegistry. Every process that opens an interface
+gets an `IOHIDLibUserClient` under it, named by its `IOUserClientCreator`:
+
+```bash
+ioreg -r -n "Creator Micro 2" -l -w0 | grep -E 'PrimaryUsagePage|IOUserClientCreator'
+```
+
+Over USB, look only under the vendor interface (`PrimaryUsagePage` = 65280):
+every `"pid <n>, <name>"` there can drive the lighting. The keyboard
+interface has listeners of its own (chat apps, for one) that never touch the
+vendor protocol. Over Bluetooth the pad is one device carrying the keyboard
+too, so its list mixes both. `WLDevice.otherClients()` does this walk in Swift
+(`Sources/WLKit/WLDevice+Clients.swift`). `IOUserClientCreator` is not
+documented API, and the kernel may cut a long process name short.
+
 **Variant gating is real.** These vendor methods are registered per hardware
 variant. If `v.oai.thstatus` returns `Method not found` rather than `{"ok":1}`,
 this firmware genuinely does not have it. Older Creator Micro 2 firmware

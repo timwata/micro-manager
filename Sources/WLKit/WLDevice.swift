@@ -439,6 +439,20 @@ public final class WLDevice {
         return nil
     }
 
+    // MARK: - Other clients
+
+    /// The other processes holding the opened device, from the IORegistry
+    /// (see `scanClients(of:vendorInterface:)`). `.authoritative` on a
+    /// dedicated vendor interface (USB); `.advisory` when the device carries
+    /// the keyboard as well (Bluetooth), where a client may only be listening
+    /// for keys. `.unavailable` when nothing is open, which includes the
+    /// emulator: it never opens an IOHIDDevice, and when the scan does not
+    /// see this process's own client.
+    public func otherClients() -> HIDClientScan {
+        guard let dev = device else { return .unavailable }
+        return WLDevice.scanClients(of: dev, vendorInterface: primaryUsagePage(dev) == WLDevice.vendorUsagePage)
+    }
+
     // MARK: - Properties
 
     private func string(_ dev: IOHIDDevice, _ key: String) -> String? {
