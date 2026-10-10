@@ -256,8 +256,8 @@ struct MenuPanelView: View {
         let isUnavailable = bridge.isRemote && (isStackKey || isLandKey)
         let macroText = bridge.keyBindings.text(for: index)
         let isVoiceKey = macroText == nil && Pad.voiceKeyIDs.contains(index)
-        // Key index and agent slot are different orderings — the top row is
-        // wired right to left — so the slot lookup goes through the pad map.
+        // Only some keys are agent keys, so the slot lookup goes through the
+        // pad map.
         let slot = Pad.agentSlot(for: index)
         let agent = slot.flatMap { $0 < bridge.agents.count ? bridge.agents[$0] : nil }
 

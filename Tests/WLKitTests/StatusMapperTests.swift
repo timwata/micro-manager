@@ -47,9 +47,9 @@ final class StatusMapperTests: XCTestCase {
             agent("working"), agent("blocked"), agent("idle"),
         ])
         XCTAssertEqual(threads.count, 6, "one entry per agent key")
-        // The pad's top row is wired right to left, so reading order starts
-        // at key 1: the first agent lights the top-LEFT key.
-        XCTAssertEqual(threads.map(\.id), [1, 0, 2, 3, 4, 5], "keys in reading order")
+        // Every row runs left to right, so reading order is index order: the
+        // first agent lights key 0, the top-LEFT key.
+        XCTAssertEqual(threads.map(\.id), [0, 1, 2, 3, 4, 5], "keys in reading order")
         XCTAssertEqual(threads[0].color, 0xFFA000)
         XCTAssertEqual(threads[1].color, 0xFF2D2D)
         XCTAssertEqual(threads[2].color, 0x00C853)

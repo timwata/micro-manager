@@ -375,23 +375,25 @@ to take a whole row's keycodes with it.
 
 ### Geometry
 
-The matrix is `[2, 4, 4, 3]` and the key index runs row-major from 0. One
-surprise: **the top row is wired right to left**, so index 0 is the top-**right**
-key.
+The matrix is `[2, 4, 4, 3]` and the key index runs row-major from 0, every
+row left to right, on a four-column grid. The top row's two keys sit in the
+middle columns, between the dial and the joystick; the bottom row starts one
+column in.
 
 ```
- ┌─────────────┬─────────────┐
- │      1      │      0      │   row 0   <- reversed: 0 is on the RIGHT
- ├──────┬──────┼──────┬──────┤
+        ┌──────┬──────┐
+ (dial) │   0  │   1  │ (joy)   row 0
+ ┌──────┼──────┼──────┼──────┐
  │   2  │   3  │   4  │   5  │   row 1
  ├──────┼──────┼──────┼──────┤
  │   6  │   7  │   8  │   9  │   row 2
- ├──────┴──────┼──────┴──────┤
- │    10 + 11  │     12      │   row 3
- └─────────────┴─────────────┘
+ └──────┼──────┴──────┼──────┤
+        │   10 + 11   │  12  │   row 3
+        └─────────────┴──────┘
 ```
 
-Rows 1–3 run left to right in index order. Matrix positions 10 and 11 sit under
+An earlier version of this guide had the top row wired right to left; on the
+hardware, pressing the top-left key reports `AG00`. Matrix positions 10 and 11 sit under
 one wide keycap — the stock map leaves 11 as `KC_NONE`; bind and light both if
 you want the whole cap to glow evenly.
 
