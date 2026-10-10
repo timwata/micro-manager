@@ -1,6 +1,6 @@
 # Fix plan: follow-up review of `main` (2026-10-10)
 
-Status: Phase 1 implemented; Phase 2 planned.
+Status: Phases 1 and 2 implemented.
 
 Source: a whole-repo review of `main` at `b303213` (after all six PRs of
 `design/review-fixes.md` were merged). Build and tests were green at that
@@ -308,24 +308,57 @@ Notes:
 
 Branch `fix/followup-2-device-hygiene` · PR title `fix: no futile keymap writes, close the hid manager on failure`
 
-- [ ] F3: `KeymapManager.Failure.cannotApply` with an actionable message.
-- [ ] F3: `apply` checks `isAgentKeymapApplied(withAgentKeymap(config))`
+- [x] F3: `KeymapManager.Failure.cannotApply` with an actionable message.
+- [x] F3: `apply` checks `isAgentKeymapApplied(withAgentKeymap(config))`
       before writing, and throws `.cannotApply` without `fs.write`.
-- [ ] F3 tests: three pure layout cases; the emulator case (no `fs.write`
+- [x] F3 tests: three pure layout cases; the emulator case (no `fs.write`
       after the test's own); the stock layout still writes exactly once.
-- [ ] F3: if `PadEmulator` gained a counter, it changes no reply (the
+- [x] F3: if `PadEmulator` gained a counter, it changes no reply (the
       emulator stays faithful to the firmware); say so in Notes.
-- [ ] F4: `WLDevice.closeManager()`; called on every failed `connect()` and
+- [x] F4: `WLDevice.closeManager()`; called on every failed `connect()` and
       from `disconnect(reason:)` even when no device is open.
 - [ ] F4 **verify** (needs a pad you can unplug, else a user check): with
       the bridge off and the pad unplugged, plug it in; `ioreg -r -n
       "Creator Micro 2" -l -w0 | grep IOUserClientCreator` lists no client
       created by the app. Before the fix, record whether it did.
-- [ ] `LiveDeviceTests` still pass with a pad, or skip without one.
-- [ ] `swift build -c release` (zero warnings) and
+      *Not done in the session: user check (see Notes).*
+- [x] `LiveDeviceTests` still pass with a pad, or skip without one.
+- [x] `swift build -c release` (zero warnings) and
       `env -u HERDR_SOCKET_PATH swift test` green.
 
 Notes:
+
+- **No emulator counter.** `PadEmulator.traffic` already logs one
+  `fs.write keymap.json …` line per accepted write, so the tests count
+  those lines. `PadEmulator` is unchanged.
+- **Test layouts.** Built from `PadEmulator.stockKeymap()` as planned: the
+  last key of row 3 removed (a bound key outside the matrix), `encoders`
+  set to `[["KC_MPLY"]]`, and the north sector (`KI_X`) removed from the
+  joystick. The device test writes each one with its own `fs.write` on a
+  fresh emulator, then expects `.cannotApply` and still one write.
+- **`disconnect(reason:)` without a device.** With `connect()` closing the
+  manager on every throw, the no-device branch should never find one
+  open. It closes it anyway, as the plan says, so the guarantee does not
+  rest on every `connect()` path. `connect()` starts with
+  `disconnect(reason: nil)`, so a reconnect also closes any stray one.
+- **Mutation checks.** Each restored afterwards:
+  - No `cannotApply` guard in `apply`: the emulator test fails for all
+    three layouts (`notAccepted` instead of `cannotApply`, and 2 writes
+    instead of 1).
+  - Guard inverted: the stock test fails (`cannotApply` on a layout that
+    can take the bindings).
+  - A second `fs.write` in `apply`: the stock test fails (2 writes).
+  - The dial check dropped from `isAgentKeymapApplied`: the pure test
+    fails for "a dial with one slot".
+- **F4 verify not done.** The session had the pad on USB but nobody to
+  unplug it, so neither the before nor the after `ioreg` result is
+  recorded. It is listed as a user check in the PR. F4 has no automated
+  test (it needs a real IOKit device and a missing pad).
+- **`LiveDeviceTests`** ran against the real pad (USB) and passed, which
+  covers the success path of the changed `connect()`. The installed app
+  was running and holding the pad at the time.
+- Full suite: 200 tests, 0 failures, 2 skipped. Release build in a clean
+  `--build-path`: zero warnings.
 
 ### Done
 
