@@ -181,9 +181,25 @@ State, in `BridgeController`:
 |---|---|---|---|
 | `.unavailable` | — | `trafficSeen` | none (Phase 1 behaviour) |
 | `.authoritative` | empty | false | cleared: whoever sent it is gone |
-| `.authoritative` | some | true | none |
+| `.authoritative` | some | true, unless all acknowledged | none |
 | `.advisory` | empty | false | cleared |
 | `.advisory` | some | `trafficSeen` | none: the list labels, it cannot raise |
+
+Acknowledged clients (added after PR #20's review): `recheckContention()`
+records the pids of the `.authoritative` others it finds in a private
+`acknowledgedPIDs: Set<pid_t>`, and only others outside that set raise the
+warning. Without it, an app that opens every HID device (an input remapper,
+a macro or streaming tool) but never sends would raise the warning on every
+scan, and nothing short of quitting it would clear it: Recheck rescans and
+finds it again, and so does an off/on toggle. Acknowledged clients:
+
+- are still listed in `contenders`, so they are named if the warning comes
+  up for another reason;
+- still raise it through `trafficSeen` when they send;
+- drop out of the set when a scan (`.authoritative` or `.advisory`) no
+  longer lists them, so a relaunched app raises the warning again;
+  `.unavailable` keeps the set, since it says nothing about who left;
+- are forgotten by `start()` and `stop()` (`resetContention()`).
 
 Scans run:
 
@@ -191,8 +207,9 @@ Scans run:
   `didBecomeKeyNotification` hooks in `MenuPanelView`, which already call
   `reloadRemotes()`, also call a new `bridge.scanContention()` (scan only,
   no repaint);
-- from **Recheck**: `recheckContention()` clears `trafficSeen`, scans, then
-  repaints as in Phase 1;
+- from **Recheck**: `recheckContention()` clears `trafficSeen`, scans,
+  acknowledges the `.authoritative` others it found, then repaints as in
+  Phase 1;
 - after a foreign reply, to put a name on it: at most one scan per second,
   so a chatty client cannot turn every reply into a registry walk;
 - after the device (re)opens in `openDevice()`.
@@ -448,6 +465,25 @@ Notes:
 - No hardware or UI check was done in-session; the named warning and the
   clear-on-reopen round trip are user checks in the PR. Bluetooth remains
   unverified (Phase 2 Notes).
+- Review follow-up (PR #20): an app that holds the vendor interface but never
+  sends made the warning permanent, since every scan (Recheck's and the
+  reopen's included) found it again. Not verified on hardware: it follows
+  from IOKit matching, where a manager with nil or broad matching opens the
+  0xFF00 interface like any other. Fixed by letting Recheck acknowledge the
+  clients it finds (`acknowledgedPIDs`, Part 1). Recheck's help text now
+  reads "Check again for other apps, accept the ones still holding the pad,
+  and repaint it. The warning comes back if one of them sends to the pad, or
+  another app opens it." `testRecheckScans` changed accordingly: a Recheck
+  that still finds the Inspector now clears the warning.
+- Mutation checks for the follow-up, each restored afterwards: Recheck does
+  not acknowledge (recheck, passive holder, unacknowledged, acknowledged
+  reply, unavailable keeps, stop forgets); no pruning (quit app forgotten);
+  `.unavailable` clears the set (unavailable keeps); `resetContention()`
+  keeps the set (stop forgets); the set ignored when raising (as "does not
+  acknowledge"); every other acknowledged, i.e. authoritative others never
+  raise (authoritative-others, open, unplug, off, passive holder,
+  unacknowledged, quit app forgotten, stop forgets); an acknowledged client
+  hides `trafficSeen` (acknowledged reply).
 
 ### Done
 

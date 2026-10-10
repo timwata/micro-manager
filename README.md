@@ -296,6 +296,14 @@ the next time you open the panel after that app has quit. **Recheck** next to
 the warning checks again on the spot and repaints the pad with the manager's
 colours. Switching the manager off clears the warning too.
 
+Some apps (input remappers, macro or streaming tools) open every HID device
+without ever touching the lighting, and would keep the warning up for as long
+as they run. **Recheck** accepts the apps holding the pad at that moment: they
+no longer raise the warning on their own, though they are still named if it
+comes up for another reason. It comes back when one of them sends to the pad,
+when a different app opens it, or when an accepted app quits and is started
+again. Switching the manager off and on forgets what was accepted.
+
 Over Bluetooth the pad is a single device that also carries the keyboard, so
 apps that only listen for keys (chat apps, for one) may hold it open too. There the
 check can name the apps but not raise the warning by itself: it still takes a

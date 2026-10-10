@@ -266,8 +266,8 @@ final class BridgeContentionTests: XCTestCase {
     }
 
     /// Recheck forgets the replies and rescans: an empty authoritative list
-    /// clears the warning, and one that still has the other app keeps it up.
-    /// It repaints either way.
+    /// clears the warning, and so does one that still has the other app,
+    /// which Recheck acknowledges. It repaints either way.
     func testRecheckScans() async throws {
         await startScanned()
         seeTraffic()
@@ -276,8 +276,8 @@ final class BridgeContentionTests: XCTestCase {
         scanResult = .authoritative([inspector])
         await bridge.recheckContention()
         XCTAssertEqual(scans, before + 1)
-        XCTAssertTrue(bridge.contendingClient, "the other app is still there")
-        XCTAssertEqual(bridge.contenders, [inspector])
+        XCTAssertFalse(bridge.contendingClient, "the app still there is acknowledged")
+        XCTAssertEqual(bridge.contenders, [inspector], "and still listed")
 
         scanResult = .authoritative([])
         await bridge.recheckContention()
@@ -286,6 +286,98 @@ final class BridgeContentionTests: XCTestCase {
         scanResult = .unavailable
         bridge.scanContention()
         XCTAssertFalse(bridge.contendingClient, "the replies seen earlier stay forgotten")
+    }
+
+    // MARK: - Acknowledged clients
+
+    private let relaunched = HIDClient(pid: 4343, name: "Inspector")
+    private let input = HIDClient(pid: 5151, name: "Input")
+
+    /// An app that holds the vendor interface but never sends (one that opens
+    /// every HID device, say) raises the warning on every scan. Recheck lets
+    /// it stay: later scans that still list it keep the warning down, while
+    /// it is still named should the warning come up for another reason.
+    func testRecheckAcknowledgesAPassiveHolder() async {
+        await startScanned(.authoritative([inspector]))
+        XCTAssertTrue(bridge.contendingClient)
+
+        await bridge.recheckContention()
+        XCTAssertFalse(bridge.contendingClient)
+
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient, "a later scan still listing it")
+        XCTAssertEqual(bridge.contenders, [inspector])
+    }
+
+    /// Acknowledging one app does not excuse another that opens the pad
+    /// later.
+    func testAnUnacknowledgedClientStillRaises() async {
+        await startScanned(.authoritative([inspector]))
+        await bridge.recheckContention()
+        XCTAssertFalse(bridge.contendingClient)
+
+        scanResult = .authoritative([inspector, input])
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient)
+        XCTAssertEqual(bridge.contenders, [inspector, input])
+    }
+
+    /// An acknowledged app that sends to the pad raises the warning through
+    /// its replies, and is named.
+    func testAnAcknowledgedClientsReplyStillRaises() async {
+        await startScanned(.authoritative([inspector]))
+        await bridge.recheckContention()
+        XCTAssertFalse(bridge.contendingClient)
+
+        bridge.noteResponse(id: foreignID)
+        XCTAssertTrue(bridge.contendingClient)
+        XCTAssertEqual(bridge.contenders, [inspector])
+    }
+
+    /// The acknowledgement is by pid. Once a scan no longer lists the app it
+    /// is forgotten, so the same app relaunched raises the warning again —
+    /// even if it comes back under the old pid.
+    func testAQuitAppIsForgotten() async {
+        await startScanned(.authoritative([inspector]))
+        await bridge.recheckContention()
+
+        scanResult = .authoritative([])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient)
+
+        scanResult = .authoritative([relaunched])
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient, "a relaunch under a new pid")
+
+        scanResult = .authoritative([])
+        bridge.scanContention()
+        scanResult = .authoritative([inspector])
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient, "the old pid, after a scan without it")
+    }
+
+    /// An unavailable scan says nothing about who left, so it keeps the
+    /// acknowledgement.
+    func testUnavailableScanKeepsTheAcknowledgement() async {
+        await startScanned(.authoritative([inspector]))
+        await bridge.recheckContention()
+
+        scanResult = .unavailable
+        bridge.scanContention()
+        scanResult = .authoritative([inspector])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient)
+    }
+
+    /// Switching off and on forgets what Recheck acknowledged.
+    func testStopForgetsTheAcknowledgement() async {
+        await startScanned(.authoritative([inspector]))
+        await bridge.recheckContention()
+        XCTAssertFalse(bridge.contendingClient)
+
+        await bridge.stop()
+        await bridge.start()
+        XCTAssertTrue(bridge.contendingClient, "the open scan lists it again")
     }
 
     /// Switched off, nothing is scanned and nothing is named, whatever the

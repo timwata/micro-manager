@@ -111,6 +111,12 @@ public final class BridgeController: ObservableObject {
     /// The last registry scan's verdict; `.unavailable` until one has run
     /// on an open device.
     private var lastScan: HIDClientScan = .unavailable
+    /// Other clients the user let stay with Recheck. They still hold the
+    /// pad, but no longer raise the warning on their own: an app that opens
+    /// every HID device and never sends would otherwise keep it up for good.
+    /// Their replies still do, through `trafficSeen`. A pid drops out once a
+    /// scan no longer lists it, so a relaunched app raises the warning again.
+    private var acknowledgedPIDs = Set<pid_t>()
     /// When the last reply-triggered scan ran, on the `uptime` clock.
     private var lastReplyScan: TimeInterval?
     /// Who else holds the pad open. A seam for tests; reads the device at
@@ -226,17 +232,22 @@ public final class BridgeController: ObservableObject {
         applyScan()
     }
 
-    /// The panel's Recheck: forgets the replies seen so far, rescans, and
-    /// repaints so our colours replace whatever the other app left on the
-    /// pad. Without a usable scan this proves nothing by itself — the warning
-    /// comes back as soon as the other app, if it is still there, sends to
-    /// the pad again.
+    /// The panel's Recheck: forgets the replies seen so far, rescans,
+    /// acknowledges the other clients the scan still lists, and repaints so
+    /// our colours replace whatever the other app left on the pad. This
+    /// proves nothing by itself — the warning comes back as soon as the
+    /// other app, if it is still there, sends to the pad again, or a client
+    /// that was not acknowledged opens it.
     public func recheckContention() async {
         // `issuedIDs` is left alone on purpose: a reply to one of our own
         // calls still in flight would otherwise look foreign and raise the
         // warning again at once.
         trafficSeen = false
         applyScan()
+        if case .authoritative(let others) = lastScan {
+            acknowledgedPIDs = Set(others.map(\.pid))
+            updateContention()
+        }
         guard isRunning else { return }
         await forceRepaint()
     }
@@ -251,6 +262,9 @@ public final class BridgeController: ObservableObject {
             // has gone. Only a fresh scan clears: replies seen after it
             // raise the warning again until the next one.
             if others.isEmpty { trafficSeen = false }
+            // An acknowledged app that has quit is forgotten, so the same app
+            // relaunched (a new pid) raises the warning again.
+            acknowledgedPIDs.formIntersection(others.map(\.pid))
         case .unavailable:
             break
         }
@@ -262,7 +276,8 @@ public final class BridgeController: ObservableObject {
     ///
     /// - unavailable: the replies alone (passive detection);
     /// - authoritative (a dedicated vendor interface, USB): anyone else
-    ///   there can drive the lighting, so a non-empty list raises it;
+    ///   there can drive the lighting, so a client Recheck did not
+    ///   acknowledge raises it;
     /// - advisory (the pad's only interface, Bluetooth): others may only be
     ///   listening for keys, so the list names but cannot raise.
     ///
@@ -274,17 +289,19 @@ public final class BridgeController: ObservableObject {
             contendingClient = trafficSeen
         case .authoritative(let others):
             contenders = others
-            contendingClient = trafficSeen || !others.isEmpty
+            contendingClient = trafficSeen || others.contains { !acknowledgedPIDs.contains($0.pid) }
         case .advisory(let others):
             contenders = others
             contendingClient = trafficSeen
         }
     }
 
-    /// Clears both signals; for `start()` and `stop()`.
+    /// Clears both signals and the acknowledgement; for `start()` and
+    /// `stop()`.
     private func resetContention() {
         trafficSeen = false
         lastScan = .unavailable
+        acknowledgedPIDs = []
         lastReplyScan = nil
         updateContention()
     }

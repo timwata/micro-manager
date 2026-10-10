@@ -47,7 +47,7 @@ struct MenuPanelView: View {
                     Spacer(minLength: 0)
                     Button("Recheck") { Task { await bridge.recheckContention() } }
                         .controlSize(.small)
-                        .help("Check again for other apps and repaint the pad. The warning comes back if the other app is still there.")
+                        .help("Check again for other apps, accept the ones still holding the pad, and repaint it. The warning comes back if one of them sends to the pad, or another app opens it.")
                 }
                 .padding(.horizontal, 14).padding(.vertical, 8)
             }
