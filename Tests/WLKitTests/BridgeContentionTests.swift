@@ -299,6 +299,61 @@ final class BridgeContentionTests: XCTestCase {
         XCTAssertTrue(bridge.contendingClient)
     }
 
+    /// The third report: after the Mac wakes and the screen is unlocked,
+    /// "Also driving this pad: input" until Recheck. Input reconnects to its
+    /// devices on every unlock — its client leaves the registry and comes
+    /// back — and asks for `device.status` (or `sys.version`) a second
+    /// later. Those replies are objects, not the lighting's {"ok":1}, so
+    /// they neither raise the warning nor scan, and Input stays quiet.
+    func testInputReconnectingAfterAnUnlockDoesNotRaise() async {
+        await startScanned(.authoritative([input]))
+        let pad = PadEmulator()
+
+        scanResult = .authoritative([])
+        bridge.scanContention()             // the panel opens during the gap
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+
+        let before = scans
+        for method in ["device.status", "sys.version"] {
+            let (result, error) = pad.handle(method, params: nil)
+            bridge.noteResponse(id: foreignID, result: result, error: error)
+            XCTAssertFalse(bridge.contendingClient, method)
+        }
+        XCTAssertEqual(scans, before, "a reply to a query does not scan")
+
+        reply(while: [input, inspector])
+        XCTAssertEqual(bridge.contenders, [inspector], "Input is still taken for quiet")
+    }
+
+    /// Which of the emulator's answers count as a fight over the colours:
+    /// the lighting calls and the keymap write (all {"ok":1}) and errors do;
+    /// the queries and the focus announcement do not.
+    func testOnlyLightingAndWriteRepliesCount() {
+        let pad = PadEmulator()
+        let counted: [(String, Any?)] = [
+            (OAI.methodThreads, OAI.threadsParams([])),
+            (OAI.methodRGBConfig, nil),
+            ("fs.write", ["file": "keymap.json", "data": "{}"]),
+            ("no.such.method", nil),
+        ]
+        let ignored: [(String, Any?)] = [
+            ("sys.version", nil),
+            ("device.status", nil),
+            ("fs.list", nil),
+            ("fs.read", ["file": "keymap.json"]),
+            ("host.focused_app", ["name": "Finder"]),
+        ]
+        for (method, params) in counted {
+            let (result, error) = pad.handle(method, params: params)
+            XCTAssertTrue(BridgeController.isAboutTheLighting(result: result, error: error), method)
+        }
+        for (method, params) in ignored {
+            let (result, error) = pad.handle(method, params: params)
+            XCTAssertFalse(BridgeController.isAboutTheLighting(result: result, error: error), method)
+        }
+    }
+
     /// A quiet holder that starts sending is all there is to blame, and the
     /// warning stays until it has gone.
     func testAQuietHolderThatSendsIsBlamed() async {

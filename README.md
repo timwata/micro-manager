@@ -286,8 +286,8 @@ downloading.
 Work Louder's Input app and the Codex desktop app drive this same pad. Running
 two at once means they overwrite each other. The panel detects this — the device
 is opened shared, so we receive other clients' replies, and a response id we
-never issued is a reliable tell. The **Inspector** counts too: it is a separate
-process with its own connection to the pad.
+never issued is a reliable tell. The **Inspector** counts too, once it changes
+the lighting: it is a separate process with its own connection to the pad.
 
 The manager also asks macOS which other processes hold the pad open, each time
 the panel opens and whenever such a reply comes in. The warning names the app
@@ -299,8 +299,10 @@ the warning too.
 
 Holding the pad open is not driving it, so that alone never raises the
 warning. Work Louder's Input app keeps the pad open while it runs in the
-background, and tells the pad which app is in front on every app switch; the
-manager ignores those messages, since they leave the lighting alone. Some apps (input remappers, macro or streaming tools) open
+background, tells the pad which app is in front on every app switch, and
+reconnects and asks for the pad's status every time you unlock the Mac; the
+manager ignores those messages, since they leave the lighting alone. Only
+another app's lighting changes and keymap writes count. Some apps (input remappers, macro or streaming tools) open
 every HID device without ever touching the lighting. The manager remembers
 the apps that were holding the pad quietly, and blames a reply on an app that
 arrived since. If one of the quiet apps starts sending, the warning names all

@@ -549,6 +549,35 @@ Notes:
   (device-reply-result).
 - Not checked on hardware after the fix: whether the warning stays down
   through an Inspector round trip with Input running (user check).
+- **Input's reconnect on unlock (third report).** After closing and reopening
+  the MacBook's lid, the panel read "Also driving this pad: input — colours
+  may fight." until Recheck. Cause, read from Input's bundle
+  (`/Applications/input.app/Contents/Resources/app.asar`): its main process
+  listens for Electron's `powerMonitor` `unlock-screen` and then calls
+  `disconnectAllDevices()` and `resetFoundDevices()`; device search
+  reconnects the pad, and `onDeviceConnected` waits 1 s and calls
+  `device.status` (falling back to `sys.version`). Both replies are objects,
+  so the null filter above let them through. Input was quiet, so the
+  fallback laid the reply at it, and the warning stayed for as long as Input
+  runs. (If a panel scan fell into the reconnect gap, Input came back as a
+  newcomer and was blamed all the same.) Fix: the filter is now an
+  allow-list by shape, `BridgeController.isAboutTheLighting(result:error:)`:
+  a foreign reply counts only when it carries an error or its result is a
+  dictionary with an `ok` key — what the lighting calls and `fs.write`
+  answer. Queries (`sys.version`, `device.status`, `fs.list`, `fs.read`) and
+  `host.focused_app` no longer count. Errors still count, as before.
+  Behaviour change: the Inspector only asks `sys.version` and
+  `device.status` when it connects, so opening it no longer raises the
+  warning; using its lighting controls (or the console's `v.oai.*`) does.
+  The earlier user checks that say "Inspector open → named warning" now
+  need a colour sent from the Inspector.
+- Mutation checks for it, each restored afterwards: the null-only filter
+  back (unlock-reconnect, lighting-and-write-count); errors ignored
+  (error-reply, lighting-and-write-count).
+- User checks, done by the user on hardware (not in-session): with Input
+  running and the bridge on, closing and opening the lid and unlocking
+  leaves no warning; a colour sent from the Inspector still raises the
+  named warning.
 
 ### Done
 

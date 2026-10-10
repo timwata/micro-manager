@@ -699,8 +699,13 @@ to say who may have sent them and when they have gone.
 Not every foreign reply is about the lighting, either. Input sends
 `host.focused_app` on every frontmost-app change, window or not, and the
 firmware answers it with a bare `"result": null` (checked on 2026-10-10; the
-lighting calls answer `{"ok":1}`, `sys.version` an object). So a foreign reply
-with a null result is ignored. Request ids are no help in telling senders
+lighting calls answer `{"ok":1}`, `sys.version` an object). Input also
+drops and reopens every device on each screen unlock (Electron's
+`unlock-screen`), and a second after reconnecting asks for `device.status`
+(`sys.version` if that fails), both answered with an object. Only the reply
+is seen, never the call, so the bridge goes by its shape: a foreign reply
+counts only when it is an error or a dictionary with an `ok` key (the
+lighting calls and `fs.write`). Request ids are no help in telling senders
 apart: Input's look random, while `WLDevice` counts 1…998.
 
 **Variant gating is real.** These vendor methods are registered per hardware
