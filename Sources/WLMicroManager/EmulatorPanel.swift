@@ -77,7 +77,13 @@ struct EmulatorView: View {
                 // Rows 0–2 are plain grids of single keys.
                 ForEach(Array(Pad.displayRows.prefix(3).enumerated()), id: \.offset) { _, row in
                     HStack(spacing: Self.gap) {
-                        ForEach(row, id: \.self) { key in keyButton(key) }
+                        ForEach(Array(row.enumerated()), id: \.offset) { _, key in
+                            if let key {
+                                keyButton(key)
+                            } else {
+                                Color.clear.frame(width: Self.keyW, height: Self.keyH)
+                            }
+                        }
                     }
                 }
                 // The bottom row starts one column in, and its wide keycap

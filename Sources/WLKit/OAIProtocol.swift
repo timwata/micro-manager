@@ -156,13 +156,16 @@ public enum Pad {
     /// row is wired right to left — key 0 is the top-RIGHT key — so reading
     /// order starts 1, 0. The other rows run left to right in index order.
     public static let agentKeyIDs = [1, 0, 2, 3, 4, 5]
-    /// The rows as you look at the pad, for on-screen mirrors. `rows` stays in
-    /// firmware order because the keymap file is addressed that way.
-    public static let displayRows: [[Int]] = [
-        [1, 0],
+    /// The rows as you look at the pad, for on-screen mirrors, on the pad's
+    /// four-column grid: nil is a column with no key in it. The top row sits
+    /// in the middle two columns and the bottom row starts one column in.
+    /// `rows` stays in firmware order because the keymap file is addressed
+    /// that way.
+    public static let displayRows: [[Int?]] = [
+        [nil, 1, 0, nil],
         [2, 3, 4, 5],
         [6, 7, 8, 9],
-        [10, 11, 12],
+        [nil, 10, 11, 12],
     ]
 
     /// The agent slot a key answers for, or nil for non-agent keys.
