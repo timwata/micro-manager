@@ -691,6 +691,11 @@ too, so its list mixes both. `WLDevice.otherClients()` does this walk in Swift
 (`Sources/WLKit/WLDevice+Clients.swift`). `IOUserClientCreator` is not
 documented API, and the kernel may cut a long process name short.
 
+Holding is not driving: Work Louder's Input app keeps its client on the vendor
+interface for as long as it runs, window or not, so a listed process is only
+someone who *could* send. The bridge warns on replies only, and uses the list
+to say who may have sent them and when they have gone.
+
 **Variant gating is real.** These vendor methods are registered per hardware
 variant. If `v.oai.thstatus` returns `Method not found` rather than `{"ok":1}`,
 this firmware genuinely does not have it. Older Creator Micro 2 firmware

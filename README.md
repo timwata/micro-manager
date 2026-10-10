@@ -290,25 +290,24 @@ never issued is a reliable tell. The **Inspector** counts too: it is a separate
 process with its own connection to the pad.
 
 The manager also asks macOS which other processes hold the pad open, each time
-the panel opens. Over USB that answer is exact: the warning names the other app
-("Also driving this pad: Input — colours may fight."), and it clears by itself
-the next time you open the panel after that app has quit. **Recheck** next to
-the warning checks again on the spot and repaints the pad with the manager's
-colours. Switching the manager off clears the warning too.
+the panel opens and whenever such a reply comes in. The warning names the app
+that most likely sent it ("Also driving this pad: Micro Manager Inspector —
+colours may fight."), and it clears by itself the next time you open the panel after that
+app has quit. **Recheck** next to the warning clears it on the spot and
+repaints the pad with the manager's colours. Switching the manager off clears
+the warning too.
 
-Some apps (input remappers, macro or streaming tools) open every HID device
-without ever touching the lighting, and would keep the warning up for as long
-as they run. **Recheck** accepts the apps holding the pad at that moment: they
-no longer raise the warning on their own, though they are still named if it
-comes up for another reason. It comes back when one of them sends to the pad,
-when a different app opens it, or when an accepted app quits and is started
-again. Switching the manager off and on forgets what was accepted.
+Holding the pad open is not driving it, so that alone never raises the
+warning. Work Louder's Input app keeps the pad open while it runs in the
+background, and some apps (input remappers, macro or streaming tools) open
+every HID device without ever touching the lighting. The manager remembers
+the apps that were holding the pad quietly, and blames a reply on an app that
+arrived since. If one of the quiet apps starts sending, the warning names all
+of them and stays until they have quit or you press **Recheck**.
 
 Over Bluetooth the pad is a single device that also carries the keyboard, so
-apps that only listen for keys (chat apps, for one) may hold it open too. There the
-check can name the apps but not raise the warning by itself: it still takes a
-reply we never asked for, and it stays until the other app has quit and you
-press **Recheck**, or the check finds nobody else at all. See
+apps that only listen for keys (chat apps, for one) hold it open too. They
+are quiet holders like any other. See
 [design/pad-contention.md](design/pad-contention.md) for the details.
 
 ## Development

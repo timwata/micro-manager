@@ -166,40 +166,36 @@ not see this process's own client is `.unavailable` too (Phase 2 Notes).
 
 #### Bridge and panel (Phase 3)
 
-State, in `BridgeController`:
+State, in `BridgeController` (as fixed after Phase 3; see "Passive holders"
+below for the rule this replaced):
 
-- `trafficSeen: Bool` (private): today's flag, renamed. Set by
-  `noteResponse(id:)` for a foreign id, cleared by `start()`, `stop()` and a
-  recheck.
+- `traffic` (private): `.none`; `.from(Set<pid_t>)`, the other clients that
+  may have sent the foreign replies seen since the last clear; or
+  `.unattributed`, replies seen while no scan could say who was there.
+- `quietPIDs` (private): other clients seen holding the pad while `traffic`
+  was `.none`, i.e. holding it without sending.
+- `suspectedPIDs` (private): newcomers a reply was laid at. A scan never
+  counts them as quiet while they are present.
 - `@Published public private(set) var contenders: [HIDClient]`: the last
-  scan's list, for the label.
+  scan's others that are in `.from`, else all of them, for the label.
 - `@Published public private(set) var contendingClient: Bool` stays the one
-  flag the panel shows. It is recomputed in one private `updateContention()`
-  from `trafficSeen` and the last scan:
+  flag the panel shows: `traffic != .none`. **Only replies raise it.**
 
-| last scan | others | `contendingClient` | effect on `trafficSeen` |
-|---|---|---|---|
-| `.unavailable` | — | `trafficSeen` | none (Phase 1 behaviour) |
-| `.authoritative` | empty | false | cleared: whoever sent it is gone |
-| `.authoritative` | some | true, unless all acknowledged | none |
-| `.advisory` | empty | false | cleared |
-| `.advisory` | some | `trafficSeen` | none: the list labels, it cannot raise |
+A foreign reply is laid at the newcomers of the last scan (others not in
+`quietPIDs`), or at every other when all of them are quiet, and added to the
+earlier suspects; with no scan to go on it is `.unattributed`, and stays so.
+Each scan that is not `.unavailable` (`.authoritative` and `.advisory`
+alike) then:
 
-Acknowledged clients (added after PR #20's review): `recheckContention()`
-records the pids of the `.authoritative` others it finds in a private
-`acknowledgedPIDs: Set<pid_t>`, and only others outside that set raise the
-warning. Without it, an app that opens every HID device (an input remapper,
-a macro or streaming tool) but never sends would raise the warning on every
-scan, and nothing short of quitting it would clear it: Recheck rescans and
-finds it again, and so does an off/on toggle. Acknowledged clients:
+| `traffic` | effect |
+|---|---|
+| `.none` | the others not in `suspectedPIDs` join `quietPIDs` |
+| `.from(s)` | `s` shrinks to the others still listed; `.none` once empty |
+| `.unattributed` | `.none` only when nobody else is listed |
 
-- are still listed in `contenders`, so they are named if the warning comes
-  up for another reason;
-- still raise it through `trafficSeen` when they send;
-- drop out of the set when a scan (`.authoritative` or `.advisory`) no
-  longer lists them, so a relaunched app raises the warning again;
-  `.unavailable` keeps the set, since it says nothing about who left;
-- are forgotten by `start()` and `stop()` (`resetContention()`).
+and prunes `quietPIDs` and `suspectedPIDs` to the others it lists.
+`.unavailable` changes nothing. `start()` and `stop()` forget it all
+(`resetContention()`).
 
 Scans run:
 
@@ -207,9 +203,8 @@ Scans run:
   `didBecomeKeyNotification` hooks in `MenuPanelView`, which already call
   `reloadRemotes()`, also call a new `bridge.scanContention()` (scan only,
   no repaint);
-- from **Recheck**: `recheckContention()` clears `trafficSeen`, scans,
-  acknowledges the `.authoritative` others it found, then repaints as in
-  Phase 1;
+- from **Recheck**: `recheckContention()` clears `traffic`, scans, then
+  repaints as in Phase 1;
 - after a foreign reply, to put a name on it: at most one scan per second,
   so a chatty client cannot turn every reply into a registry walk;
 - after the device (re)opens in `openDevice()`.
@@ -224,8 +219,8 @@ time; `useEmulator` replaces it), like `listAgents`.
 
 Panel copy:
 
-- authoritative, or advisory with traffic seen and names known: "Also driving
-  this pad: Input, Inspector — colours may fight."
+- names known: "Also driving this pad: Micro Manager Inspector — colours may
+  fight."
 - names unknown: today's text.
 - **Recheck** stays in every case.
 
@@ -484,6 +479,54 @@ Notes:
   raise (authoritative-others, open, unplug, off, passive holder,
   unacknowledged, quit app forgotten, stop forgets); an acknowledged client
   hides `trafficSeen` (acknowledged reply).
+- **Passive holders (bug fix after PR #20).** Reported: right after launch,
+  with nothing else open, the panel read "Also driving this pad: input —
+  colours may fight."; Recheck cleared it; with the Inspector open it read
+  "input, Micro Manager Inspector". Cause: Work Louder's Input
+  (`/Applications/input.app`) kept running in the background after its
+  window was closed, and held a client on the vendor interface
+  (`ioreg`: `"pid 24802, input"` under `PrimaryUsagePage` 65280, the same
+  pid as in Phase 2's verify) without sending. The rule "an `.authoritative`
+  scan with others raises the warning by itself" turned that into a warning
+  on every launch, since `start()` forgets what Recheck acknowledged, and
+  `acknowledgedPIDs` only hid it until the next off/on or relaunch. Holding
+  is not driving — "colours may fight" needs a sender — so the fix drops the
+  presence rule: only foreign replies raise the warning, and the scan says
+  who may have sent them (Part 1). Laying a reply at every other client
+  would have kept the warning up after the Inspector quit for as long as
+  Input runs, which breaks Phase 3's clear-on-reopen in exactly this setup;
+  hence `quietPIDs` and the newcomer rule. `suspectedPIDs` keeps a Recheck
+  (or a panel scan after it) with the Inspector still open from making the
+  Inspector quiet, after which its next reply would be laid at Input too.
+  `acknowledgedPIDs` is gone, and so is the bridge's distinction between
+  `.authoritative` and `.advisory`; Recheck's help text is now "Clear the
+  warning, check again for other apps, and repaint the pad. The warning
+  comes back if another app sends to the pad again."
+- Known limits of the newcomer rule: a client that was already holding the
+  pad when it was first seen (at open, say) counts as quiet, so its first
+  reply is laid at every other client too, and the warning then stays until
+  they have all gone or Recheck is pressed. A reply within the reply-scan
+  window is laid at the clients of the last scan, so an app that opened and
+  sent within that second goes unblamed until its next reply.
+- Mutation checks for the fix, each restored afterwards: presence raises
+  again (holding-alone, newcomer, quiet-at-all, recheck-suspected,
+  recheck-scans, unavailable-keeps); no newcomer rule (newcomer,
+  quiet-at-all, recheck-suspected, unavailable-keeps); newcomers not
+  suspected (recheck-suspected); quiet not pruned (holder-left); suspects
+  not pruned (suspect-left); reset keeps suspects (stop-forgets);
+  `.unattributed` clears on any scan, and `.unattributed` turned into
+  `.from` by a later reply (both unattributed-needs-empty); earlier suspects
+  replaced, not added to (suspects-add-up); quiet holders blamed on nobody
+  (quiet-sends, quiet-at-all); no quiet marking (newcomer, quiet-at-all,
+  recheck-suspected, unavailable-keeps); `.unavailable` clears `quietPIDs`
+  (unavailable-keeps); names not filtered by the suspects (newcomer,
+  quiet-at-all, recheck-suspected, unavailable-keeps); Recheck keeps the
+  traffic (recheck tests, stop); `openDevice()` does not scan
+  (holding-alone, newcomer, limit, and others).
+- No hardware or UI check of the fix was done in-session. User checks: with
+  Input running in the background, launch → no warning; open the Inspector
+  → "Also driving this pad: Micro Manager Inspector"; quit it and reopen
+  the panel → warning gone.
 
 ### Done
 

@@ -33,13 +33,17 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var keyEffects: [Int: OAI.Effect] = [:]
     @Published public private(set) var aggregateState: String?
     @Published public private(set) var lastError: String?
-    /// Another process is driving the same pad. Two signals feed it: a reply
-    /// id we never issued (a shared HID open means we receive other clients'
-    /// replies too), and a scan of the IORegistry for other processes holding
-    /// the pad open. `updateContention()` has the rule that combines them.
+    /// Another process is driving the same pad: a reply id we never issued
+    /// has been seen (a shared HID open means we receive other clients'
+    /// replies too). A scan of the IORegistry for the other processes holding
+    /// the pad says who may have sent it, and clears the warning once they
+    /// have all gone. Holding the pad without sending never raises it: an
+    /// app that opens every HID device, or Work Louder's Input idling in the
+    /// background, cannot make the colours fight.
     @Published public private(set) var contendingClient = false
     /// The other processes the last registry scan found, to name them in the
-    /// warning. Empty when the scan was unavailable.
+    /// warning: those that may have sent the replies, else all of them.
+    /// Empty when the scan was unavailable.
     @Published public private(set) var contenders: [HIDClient] = []
     /// Whether the GitButler stack is on screen. Only the key light cares —
     /// the panel itself lives in the app layer.
@@ -106,17 +110,31 @@ public final class BridgeController: ObservableObject {
     private var reopenTask: Task<Void, Never>?
     private var lastFingerprint: String?
     private var issuedIDs = Set<Int>()
-    /// A reply id we never issued has been seen since the last clear.
-    private var trafficSeen = false
+    /// Foreign replies seen since the last clear, and who may have sent them.
+    private var traffic: Traffic = .none
+    private enum Traffic: Equatable {
+        case none
+        /// From one of these other clients, by the scans around the replies.
+        /// The warning clears once a scan lists none of them.
+        case from(Set<pid_t>)
+        /// Seen while no scan could say who was there; only a scan that
+        /// finds nobody else clears it.
+        case unattributed
+    }
     /// The last registry scan's verdict; `.unavailable` until one has run
     /// on an open device.
     private var lastScan: HIDClientScan = .unavailable
-    /// Other clients the user let stay with Recheck. They still hold the
-    /// pad, but no longer raise the warning on their own: an app that opens
-    /// every HID device and never sends would otherwise keep it up for good.
-    /// Their replies still do, through `trafficSeen`. A pid drops out once a
-    /// scan no longer lists it, so a relaunched app raises the warning again.
-    private var acknowledgedPIDs = Set<pid_t>()
+    /// Other clients seen holding the pad while no foreign reply was
+    /// outstanding, and never suspected of sending one: they hold it without
+    /// talking (an app that opens every HID device, Input in the background).
+    /// A foreign reply is laid at a newcomer's door before theirs, so the
+    /// warning still clears once the newcomer has gone. A pid drops out once
+    /// a scan no longer lists it.
+    private var quietPIDs = Set<pid_t>()
+    /// Newcomers a foreign reply was laid at, kept while they hold the pad.
+    /// A scan never counts them as quiet: a Recheck while the Inspector is
+    /// still open would otherwise blame its next reply on everyone there.
+    private var suspectedPIDs = Set<pid_t>()
     /// When the last reply-triggered scan ran, on the `uptime` clock.
     private var lastReplyScan: TimeInterval?
     /// Who else holds the pad open. A seam for tests; reads the device at
@@ -213,95 +231,124 @@ public final class BridgeController: ObservableObject {
     func noteResponse(id: Int) {
         // A reply to an id we never sent came from another client.
         guard issuedIDs.remove(id) == nil else { return }
-        trafficSeen = true
-        // Scan to put a name on it, at most once a second. A reply within
-        // the window still raises the warning; it just keeps the last names.
+        // Scan to see who may have sent it, at most once a second. A reply
+        // within the window still raises the warning; it is laid at the
+        // clients of the last scan.
         let now = uptime()
         if lastReplyScan.map({ now - $0 >= Self.replyScanInterval }) ?? true {
             lastReplyScan = now
-            applyScan()
-        } else {
-            updateContention()
+            scan()
         }
+        switch (traffic, likelySenders()) {
+        case (.none, let senders?): traffic = .from(senders)
+        case (.from(let earlier), let senders?): traffic = .from(earlier.union(senders))
+        default: traffic = .unattributed
+        }
+        reconcile()
     }
 
     /// Re-reads who else holds the pad open, without repainting. The panel
     /// calls this every time it opens, so the warning clears by itself once
     /// the other app has quit.
     public func scanContention() {
-        applyScan()
+        scan()
+        reconcile()
     }
 
-    /// The panel's Recheck: forgets the replies seen so far, rescans,
-    /// acknowledges the other clients the scan still lists, and repaints so
-    /// our colours replace whatever the other app left on the pad. This
-    /// proves nothing by itself — the warning comes back as soon as the
-    /// other app, if it is still there, sends to the pad again, or a client
-    /// that was not acknowledged opens it.
+    /// The panel's Recheck: forgets the replies seen so far, rescans, and
+    /// repaints so our colours replace whatever the other app left on the
+    /// pad. This proves nothing by itself — the warning comes back as soon
+    /// as the other app, if it is still there, sends to the pad again.
     public func recheckContention() async {
         // `issuedIDs` is left alone on purpose: a reply to one of our own
         // calls still in flight would otherwise look foreign and raise the
         // warning again at once.
-        trafficSeen = false
-        applyScan()
-        if case .authoritative(let others) = lastScan {
-            acknowledgedPIDs = Set(others.map(\.pid))
-            updateContention()
-        }
+        traffic = .none
+        scanContention()
         guard isRunning else { return }
         await forceRepaint()
     }
 
     /// Scans the registry, if there is an open pad to scan. An off bridge
     /// drives nothing, so its scan is `.unavailable` without asking.
-    private func applyScan() {
+    private func scan() {
         lastScan = isRunning && deviceConnected ? scanClients() : .unavailable
+    }
+
+    /// The other clients in the last scan; nil when it was unavailable. Over
+    /// USB (`.authoritative`) they hold the vendor interface; over Bluetooth
+    /// (`.advisory`) they may only listen for keys. Either way only replies
+    /// raise the warning, so the bridge treats the two alike.
+    private var lastOthers: [HIDClient]? {
         switch lastScan {
-        case .authoritative(let others), .advisory(let others):
-            // Nobody else holds the pad now, so whoever sent those replies
-            // has gone. Only a fresh scan clears: replies seen after it
-            // raise the warning again until the next one.
-            if others.isEmpty { trafficSeen = false }
-            // An acknowledged app that has quit is forgotten, so the same app
-            // relaunched (a new pid) raises the warning again.
-            acknowledgedPIDs.formIntersection(others.map(\.pid))
-        case .unavailable:
-            break
+        case .unavailable: return nil
+        case .authoritative(let others), .advisory(let others): return others
+        }
+    }
+
+    /// Who may have sent a foreign reply, by the last scan: the other
+    /// clients not known to hold the pad quietly, or all of them when every
+    /// one is. Nil when the scan cannot say.
+    private func likelySenders() -> Set<pid_t>? {
+        guard let others = lastOthers else { return nil }
+        let present = Set(others.map(\.pid))
+        let newcomers = present.subtracting(quietPIDs)
+        // Someone quiet has started sending, and any of them may have. They
+        // stay quiet, so a later newcomer's reply is still laid at it alone.
+        guard !newcomers.isEmpty else { return present }
+        suspectedPIDs.formUnion(newcomers)
+        return newcomers
+    }
+
+    /// Brings the replies seen and the quiet clients up to date with the
+    /// last scan, then decides the warning. An unavailable scan says nothing
+    /// about who left, so it changes neither.
+    private func reconcile() {
+        if let others = lastOthers {
+            let present = Set(others.map(\.pid))
+            switch traffic {
+            case .none:
+                break
+            case .from(let senders):
+                // Only a fresh scan clears: replies seen after it raise the
+                // warning again until the next one.
+                let stillThere = senders.intersection(present)
+                traffic = stillThere.isEmpty ? .none : .from(stillThere)
+            case .unattributed:
+                // Nobody else holds the pad now, so whoever sent has gone.
+                if present.isEmpty { traffic = .none }
+            }
+            quietPIDs.formIntersection(present)
+            suspectedPIDs.formIntersection(present)
+            // Whoever holds the pad now has sent nothing since the last
+            // clear, or the reply would be outstanding.
+            if traffic == .none {
+                quietPIDs.formUnion(present.subtracting(suspectedPIDs))
+            }
         }
         updateContention()
     }
 
-    /// The one place `contendingClient` is decided, from the replies seen
-    /// and the last scan:
-    ///
-    /// - unavailable: the replies alone (passive detection);
-    /// - authoritative (a dedicated vendor interface, USB): anyone else
-    ///   there can drive the lighting, so a client Recheck did not
-    ///   acknowledge raises it;
-    /// - advisory (the pad's only interface, Bluetooth): others may only be
-    ///   listening for keys, so the list names but cannot raise.
-    ///
-    /// An empty list has already cleared the replies, in `applyScan()`.
+    /// Publishes the warning and the names it shows. Only replies raise it;
+    /// the scan names who may have sent them, else everyone else there.
     private func updateContention() {
-        switch lastScan {
-        case .unavailable:
-            contenders = []
-            contendingClient = trafficSeen
-        case .authoritative(let others):
+        contendingClient = traffic != .none
+        let others = lastOthers ?? []
+        guard case .from(let senders) = traffic else {
             contenders = others
-            contendingClient = trafficSeen || others.contains { !acknowledgedPIDs.contains($0.pid) }
-        case .advisory(let others):
-            contenders = others
-            contendingClient = trafficSeen
+            return
         }
+        let named = others.filter { senders.contains($0.pid) }
+        contenders = named.isEmpty ? others : named
     }
 
-    /// Clears both signals and the acknowledgement; for `start()` and
-    /// `stop()`.
+    /// Clears the replies seen, the last scan and what it taught; for
+    /// `start()` and `stop()`.
     private func resetContention() {
-        trafficSeen = false
+        traffic = .none
         lastScan = .unavailable
-        acknowledgedPIDs = []
+        quietPIDs = []
+        suspectedPIDs = []
         lastReplyScan = nil
         updateContention()
     }
@@ -578,9 +625,9 @@ public final class BridgeController: ObservableObject {
             warnedPermission = false
             deviceName = device.info?.product ?? "Work Louder device"
             lastError = nil
-            // A client that was already holding the pad is seen now, not
-            // only once it next sends something.
-            applyScan()
+            // Whoever already holds the pad has sent nothing we saw, so it
+            // counts as quiet: a later reply is laid at a newcomer first.
+            scanContention()
         } catch {
             deviceConnected = false
             let message = error.localizedDescription

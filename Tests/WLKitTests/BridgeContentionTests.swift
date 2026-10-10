@@ -100,6 +100,8 @@ final class BridgeContentionTests: XCTestCase {
     // MARK: - Registry scan
 
     private let inspector = HIDClient(pid: 4242, name: "Inspector")
+    private let input = HIDClient(pid: 5151, name: "Input")
+    private let relaunched = HIDClient(pid: 4343, name: "Inspector")
     /// What the stubbed scan returns next, and how often it was asked.
     private var scanResult: HIDClientScan = .unavailable
     private var scans = 0
@@ -125,6 +127,14 @@ final class BridgeContentionTests: XCTestCase {
         clock += BridgeController.replyScanInterval
     }
 
+    /// A foreign reply while the registry lists `clients`; the reply scans,
+    /// and the clock leaves the window for whatever the test does next.
+    private func reply(while clients: [HIDClient]) {
+        scanResult = .authoritative(clients)
+        bridge.noteResponse(id: foreignID)
+        clock += BridgeController.replyScanInterval
+    }
+
     /// The emulator has no registry entry, so the real scan is unavailable
     /// and nothing is named: Phase 1 behaviour, which the tests above check.
     func testEmulatorScanIsUnavailable() async {
@@ -135,8 +145,8 @@ final class BridgeContentionTests: XCTestCase {
         XCTAssertEqual(bridge.contenders, [])
     }
 
-    /// Row 1: an unavailable scan leaves the replies to decide, and does not
-    /// clear what they raised.
+    /// An unavailable scan leaves the replies to decide, and does not clear
+    /// what they raised.
     func testUnavailableScanFollowsTraffic() async {
         await startScanned()
         bridge.scanContention()
@@ -148,8 +158,8 @@ final class BridgeContentionTests: XCTestCase {
         XCTAssertEqual(bridge.contenders, [])
     }
 
-    /// Row 2: nobody else on a dedicated vendor interface clears the
-    /// warning, and forgets the replies behind it.
+    /// Nobody else on the pad clears the warning, and forgets the replies
+    /// behind it.
     func testAuthoritativeEmptyClearsTraffic() async {
         await startScanned()
         seeTraffic()
@@ -164,25 +174,7 @@ final class BridgeContentionTests: XCTestCase {
         XCTAssertFalse(bridge.contendingClient, "the replies were forgotten, not just outvoted")
     }
 
-    /// Row 3: anyone else on the vendor interface raises it with no traffic
-    /// at all, and is named.
-    func testAuthoritativeOthersRaise() async {
-        await startScanned()
-        XCTAssertFalse(bridge.contendingClient)
-
-        scanResult = .authoritative([inspector])
-        bridge.scanContention()
-        XCTAssertTrue(bridge.contendingClient)
-        XCTAssertEqual(bridge.contenders, [inspector])
-
-        // And it goes once the other app has.
-        scanResult = .authoritative([])
-        bridge.scanContention()
-        XCTAssertFalse(bridge.contendingClient)
-        XCTAssertEqual(bridge.contenders, [])
-    }
-
-    /// Row 4: an advisory empty list clears the warning and the replies.
+    /// The same over Bluetooth.
     func testAdvisoryEmptyClearsTraffic() async {
         await startScanned()
         seeTraffic()
@@ -196,20 +188,204 @@ final class BridgeContentionTests: XCTestCase {
         XCTAssertFalse(bridge.contendingClient, "the replies were forgotten, not just outvoted")
     }
 
-    /// Row 5: on a pad that also carries the keyboard, others may only be
-    /// listening for keys: the list names them but cannot raise the warning.
-    func testAdvisoryOthersOnlyLabel() async {
-        await startScanned(.advisory([inspector]))
-        XCTAssertFalse(bridge.contendingClient, "an advisory list alone does not raise it")
-        XCTAssertEqual(bridge.contenders, [inspector])
+    /// The reported bug: Input running in the background holds the vendor
+    /// interface but sends nothing, and raised the warning on every launch
+    /// until Recheck. Holding the pad alone never raises it, over USB or
+    /// Bluetooth, at open, on a later scan, or after an off/on toggle; the
+    /// holder is still named should the warning come up.
+    func testHoldingThePadAloneNeverRaises() async {
+        await startScanned(.authoritative([input]))
+        XCTAssertFalse(bridge.contendingClient, "a holder seen as the pad opens")
+        XCTAssertEqual(bridge.contenders, [input])
 
-        bridge.noteResponse(id: foreignID)
-        XCTAssertTrue(bridge.contendingClient)
-        XCTAssertEqual(bridge.contenders, [inspector])
+        scanResult = .authoritative([input, inspector])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient, "a holder that arrives later")
+
+        scanResult = .advisory([input])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient, "over Bluetooth")
+
+        scanResult = .authoritative([input])
+        await bridge.stop()
+        await bridge.start()
+        XCTAssertFalse(bridge.contendingClient, "after an off/on toggle")
     }
 
-    /// A foreign reply scans to name its sender, but at most once a second.
-    /// A reply inside the window still raises the warning.
+    /// The user check: with Input quietly holding the pad, the Inspector
+    /// opens and sends. The warning names the Inspector alone and clears by
+    /// itself once a scan no longer lists it, though Input is still there.
+    func testAReplyIsLaidAtTheNewcomer() async {
+        await startScanned(.authoritative([input]))
+
+        reply(while: [input, inspector])
+        XCTAssertTrue(bridge.contendingClient)
+        XCTAssertEqual(bridge.contenders, [inspector])
+
+        scanResult = .authoritative([input, inspector])
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient, "the Inspector is still there")
+
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient, "the Inspector has quit")
+        XCTAssertEqual(bridge.contenders, [input])
+    }
+
+    /// A quiet holder that starts sending is all there is to blame, and the
+    /// warning stays until it has gone.
+    func testAQuietHolderThatSendsIsBlamed() async {
+        await startScanned(.authoritative([input]))
+
+        reply(while: [input])
+        XCTAssertTrue(bridge.contendingClient)
+        XCTAssertEqual(bridge.contenders, [input])
+
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient)
+
+        scanResult = .authoritative([])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient)
+    }
+
+    /// A later reply adds to whom the earlier ones were laid at; it does
+    /// not replace them.
+    func testSuspectsAddUp() async {
+        await startScanned(.authoritative([input]))
+        reply(while: [input])
+        reply(while: [input, inspector])
+        XCTAssertEqual(bridge.contenders, [input, inspector])
+
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient, "Input sent the first reply")
+    }
+
+    /// When every holder is quiet, a reply is laid at all of them, so the
+    /// warning outlives the sender's quitting until Recheck. They are not
+    /// marked for good, though: a later newcomer's reply is still laid at
+    /// the newcomer alone.
+    func testAReplyFromTheQuietIsLaidAtAllOfThem() async {
+        await startScanned(.authoritative([input, inspector]))
+
+        reply(while: [input, inspector])
+        XCTAssertEqual(bridge.contenders, [input, inspector])
+
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient, "Input may have sent it")
+
+        await bridge.recheckContention()
+        XCTAssertFalse(bridge.contendingClient)
+
+        reply(while: [input, relaunched])
+        XCTAssertEqual(bridge.contenders, [relaunched])
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient)
+    }
+
+    /// Recheck with the Inspector still open clears the warning, and a scan
+    /// does not then take the Inspector for a quiet holder: its next reply
+    /// is laid at it alone, and the warning clears once it has quit.
+    func testRecheckKeepsANewcomerSuspected() async {
+        await startScanned(.authoritative([input]))
+        reply(while: [input, inspector])
+
+        await bridge.recheckContention()
+        XCTAssertFalse(bridge.contendingClient)
+        bridge.scanContention()
+
+        reply(while: [input, inspector])
+        XCTAssertEqual(bridge.contenders, [inspector])
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient)
+    }
+
+    /// A reply no scan could attribute stays until a scan finds nobody else:
+    /// any holder may have sent it.
+    func testAnUnattributedReplyNeedsAnEmptyScan() async {
+        await startScanned(.authoritative([input]))
+        scanResult = .unavailable
+        seeTraffic()
+
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient, "even the quiet Input may have sent it")
+        XCTAssertEqual(bridge.contenders, [input])
+
+        reply(while: [input, inspector])
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient, "an attributed reply does not undo an unattributed one")
+
+        scanResult = .authoritative([])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient)
+    }
+
+    /// An unavailable scan says nothing about who left: it keeps the
+    /// suspects and the quiet holders alike.
+    func testUnavailableScanKeepsWhatItKnew() async {
+        await startScanned(.authoritative([input]))
+        scanResult = .unavailable
+        bridge.scanContention()
+
+        reply(while: [input, inspector])
+        XCTAssertEqual(bridge.contenders, [inspector], "Input is still quiet")
+
+        scanResult = .unavailable
+        bridge.scanContention()
+        XCTAssertTrue(bridge.contendingClient, "the Inspector is still suspected")
+
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient)
+    }
+
+    /// A holder that leaves is no longer quiet: back again, it is a newcomer
+    /// to blame.
+    func testAHolderThatLeftIsNoLongerQuiet() async {
+        await startScanned(.authoritative([input]))
+        scanResult = .authoritative([])
+        bridge.scanContention()
+
+        reply(while: [input, inspector])
+        XCTAssertEqual(bridge.contenders, [input, inspector])
+    }
+
+    /// A suspect that leaves is forgotten: a process back under its pid
+    /// (pids are reused) and holding the pad quietly is quiet like any other.
+    func testASuspectThatLeftIsForgotten() async {
+        await startScanned(.authoritative([input]))
+        reply(while: [input, inspector])
+        scanResult = .authoritative([input])
+        bridge.scanContention()
+        XCTAssertFalse(bridge.contendingClient)
+
+        scanResult = .authoritative([input, inspector])
+        bridge.scanContention()
+        reply(while: [input, inspector])
+        XCTAssertEqual(bridge.contenders, [input, inspector])
+    }
+
+    /// Switching off and on forgets who was suspected: the reopen takes
+    /// every holder for quiet.
+    func testStopForgetsTheSuspects() async {
+        await startScanned(.authoritative([input]))
+        reply(while: [input, inspector])
+        await bridge.recheckContention()
+
+        await bridge.stop()
+        await bridge.start()
+        reply(while: [input, inspector])
+        XCTAssertEqual(bridge.contenders, [input, inspector])
+    }
+
+    /// A foreign reply scans to see who may have sent it, but at most once
+    /// a second. A reply inside the window still raises the warning.
     func testReplyScansAreLimitedToOnePerSecond() async {
         await startScanned()
         let afterStart = scans
@@ -237,37 +413,37 @@ final class BridgeContentionTests: XCTestCase {
     }
 
     /// The reply-triggered scan is what puts a name on a client first seen
-    /// by its traffic.
+    /// by its traffic, over USB and Bluetooth alike.
     func testForeignReplyNamesTheSender() async {
         await startScanned()
         scanResult = .authoritative([inspector])
         bridge.noteResponse(id: foreignID)
         XCTAssertTrue(bridge.contendingClient)
         XCTAssertEqual(bridge.contenders, [inspector])
-    }
 
-    /// A client already holding the pad is seen as the bridge opens it.
-    func testOpenScans() async {
-        await startScanned(.authoritative([inspector]))
+        await bridge.stop()
+        await startScanned()
+        scanResult = .advisory([inspector])
+        bridge.noteResponse(id: foreignID)
         XCTAssertTrue(bridge.contendingClient)
         XCTAssertEqual(bridge.contenders, [inspector])
     }
 
     /// Who held a pad that has gone says nothing about the pad that comes
-    /// back: an unplug drops the scan, and the reopen scans afresh.
+    /// back: an unplug drops the names, and the reopen scans afresh. The
+    /// replies seen stay, as they do without a scan.
     func testUnplugDropsTheScan() async {
-        await startScanned(.authoritative([inspector]))
-        XCTAssertTrue(bridge.contendingClient)
+        await startScanned(.authoritative([input]))
+        reply(while: [input, inspector])
 
         bridge.device.disconnect(reason: "unplugged")
         XCTAssertFalse(bridge.deviceConnected)
-        XCTAssertFalse(bridge.contendingClient)
+        XCTAssertTrue(bridge.contendingClient)
         XCTAssertEqual(bridge.contenders, [])
     }
 
-    /// Recheck forgets the replies and rescans: an empty authoritative list
-    /// clears the warning, and so does one that still has the other app,
-    /// which Recheck acknowledges. It repaints either way.
+    /// Recheck forgets the replies and rescans, whoever is still there, and
+    /// repaints (`testRecheckClearsAndRepaints`).
     func testRecheckScans() async throws {
         await startScanned()
         seeTraffic()
@@ -276,114 +452,19 @@ final class BridgeContentionTests: XCTestCase {
         scanResult = .authoritative([inspector])
         await bridge.recheckContention()
         XCTAssertEqual(scans, before + 1)
-        XCTAssertFalse(bridge.contendingClient, "the app still there is acknowledged")
-        XCTAssertEqual(bridge.contenders, [inspector], "and still listed")
-
-        scanResult = .authoritative([])
-        await bridge.recheckContention()
         XCTAssertFalse(bridge.contendingClient)
+        XCTAssertEqual(bridge.contenders, [inspector], "and still listed")
 
         scanResult = .unavailable
         bridge.scanContention()
         XCTAssertFalse(bridge.contendingClient, "the replies seen earlier stay forgotten")
     }
 
-    // MARK: - Acknowledged clients
-
-    private let relaunched = HIDClient(pid: 4343, name: "Inspector")
-    private let input = HIDClient(pid: 5151, name: "Input")
-
-    /// An app that holds the vendor interface but never sends (one that opens
-    /// every HID device, say) raises the warning on every scan. Recheck lets
-    /// it stay: later scans that still list it keep the warning down, while
-    /// it is still named should the warning come up for another reason.
-    func testRecheckAcknowledgesAPassiveHolder() async {
-        await startScanned(.authoritative([inspector]))
-        XCTAssertTrue(bridge.contendingClient)
-
-        await bridge.recheckContention()
-        XCTAssertFalse(bridge.contendingClient)
-
-        bridge.scanContention()
-        XCTAssertFalse(bridge.contendingClient, "a later scan still listing it")
-        XCTAssertEqual(bridge.contenders, [inspector])
-    }
-
-    /// Acknowledging one app does not excuse another that opens the pad
-    /// later.
-    func testAnUnacknowledgedClientStillRaises() async {
-        await startScanned(.authoritative([inspector]))
-        await bridge.recheckContention()
-        XCTAssertFalse(bridge.contendingClient)
-
-        scanResult = .authoritative([inspector, input])
-        bridge.scanContention()
-        XCTAssertTrue(bridge.contendingClient)
-        XCTAssertEqual(bridge.contenders, [inspector, input])
-    }
-
-    /// An acknowledged app that sends to the pad raises the warning through
-    /// its replies, and is named.
-    func testAnAcknowledgedClientsReplyStillRaises() async {
-        await startScanned(.authoritative([inspector]))
-        await bridge.recheckContention()
-        XCTAssertFalse(bridge.contendingClient)
-
-        bridge.noteResponse(id: foreignID)
-        XCTAssertTrue(bridge.contendingClient)
-        XCTAssertEqual(bridge.contenders, [inspector])
-    }
-
-    /// The acknowledgement is by pid. Once a scan no longer lists the app it
-    /// is forgotten, so the same app relaunched raises the warning again —
-    /// even if it comes back under the old pid.
-    func testAQuitAppIsForgotten() async {
-        await startScanned(.authoritative([inspector]))
-        await bridge.recheckContention()
-
-        scanResult = .authoritative([])
-        bridge.scanContention()
-        XCTAssertFalse(bridge.contendingClient)
-
-        scanResult = .authoritative([relaunched])
-        bridge.scanContention()
-        XCTAssertTrue(bridge.contendingClient, "a relaunch under a new pid")
-
-        scanResult = .authoritative([])
-        bridge.scanContention()
-        scanResult = .authoritative([inspector])
-        bridge.scanContention()
-        XCTAssertTrue(bridge.contendingClient, "the old pid, after a scan without it")
-    }
-
-    /// An unavailable scan says nothing about who left, so it keeps the
-    /// acknowledgement.
-    func testUnavailableScanKeepsTheAcknowledgement() async {
-        await startScanned(.authoritative([inspector]))
-        await bridge.recheckContention()
-
-        scanResult = .unavailable
-        bridge.scanContention()
-        scanResult = .authoritative([inspector])
-        bridge.scanContention()
-        XCTAssertFalse(bridge.contendingClient)
-    }
-
-    /// Switching off and on forgets what Recheck acknowledged.
-    func testStopForgetsTheAcknowledgement() async {
-        await startScanned(.authoritative([inspector]))
-        await bridge.recheckContention()
-        XCTAssertFalse(bridge.contendingClient)
-
-        await bridge.stop()
-        await bridge.start()
-        XCTAssertTrue(bridge.contendingClient, "the open scan lists it again")
-    }
-
     /// Switched off, nothing is scanned and nothing is named, whatever the
     /// registry would say.
     func testOffBridgeDoesNotScan() async {
-        await startScanned(.authoritative([inspector]))
+        await startScanned(.authoritative([input]))
+        reply(while: [input, inspector])
         XCTAssertTrue(bridge.contendingClient)
 
         await bridge.stop()
