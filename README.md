@@ -289,12 +289,19 @@ is opened shared, so we receive other clients' replies, and a response id we
 never issued is a reliable tell. The **Inspector** counts too: it is a separate
 process with its own connection to the pad.
 
-Detection is passive, so once raised the warning stays, even after the other
-app has quit. Quit it, then press **Recheck** next to the warning: that clears
-it and repaints the pad with the manager's colours. If the other app is still
-there, the warning comes back as soon as it next sends to the pad. Switching
-the manager off clears the warning too. An active check that clears it by
-itself is planned in [design/pad-contention.md](design/pad-contention.md).
+The manager also asks macOS which other processes hold the pad open, each time
+the panel opens. Over USB that answer is exact: the warning names the other app
+("Also driving this pad: Input — colours may fight."), and it clears by itself
+the next time you open the panel after that app has quit. **Recheck** next to
+the warning checks again on the spot and repaints the pad with the manager's
+colours. Switching the manager off clears the warning too.
+
+Over Bluetooth the pad is a single device that also carries the keyboard, so
+apps that only listen for keys (chat apps, for one) may hold it open too. There the
+check can name the apps but not raise the warning by itself: it still takes a
+reply we never asked for, and it stays until the other app has quit and you
+press **Recheck**, or the check finds nobody else at all. See
+[design/pad-contention.md](design/pad-contention.md) for the details.
 
 ## Development
 

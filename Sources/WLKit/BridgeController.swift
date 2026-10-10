@@ -33,10 +33,14 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var keyEffects: [Int: OAI.Effect] = [:]
     @Published public private(set) var aggregateState: String?
     @Published public private(set) var lastError: String?
-    /// Another process is talking to the same pad. A shared HID open means we
-    /// receive its replies too, so a response id we never issued is a reliable
-    /// tell.
+    /// Another process is driving the same pad. Two signals feed it: a reply
+    /// id we never issued (a shared HID open means we receive other clients'
+    /// replies too), and a scan of the IORegistry for other processes holding
+    /// the pad open. `updateContention()` has the rule that combines them.
     @Published public private(set) var contendingClient = false
+    /// The other processes the last registry scan found, to name them in the
+    /// warning. Empty when the scan was unavailable.
+    @Published public private(set) var contenders: [HIDClient] = []
     /// Whether the GitButler stack is on screen. Only the key light cares —
     /// the panel itself lives in the app layer.
     @Published public private(set) var stackPanelOpen = false
@@ -90,7 +94,8 @@ public final class BridgeController: ObservableObject {
 
     // MARK: - Internals
 
-    private var device = WLDevice()
+    /// Internal-read so tests can unplug the virtual pad.
+    private(set) var device = WLDevice()
     /// Non-nil while the bridge is driving a virtual pad instead of hardware.
     @Published public private(set) var emulator: PadEmulator?
     private var lifecycle: HerdrEventStream?
@@ -101,6 +106,23 @@ public final class BridgeController: ObservableObject {
     private var reopenTask: Task<Void, Never>?
     private var lastFingerprint: String?
     private var issuedIDs = Set<Int>()
+    /// A reply id we never issued has been seen since the last clear.
+    private var trafficSeen = false
+    /// The last registry scan's verdict; `.unavailable` until one has run
+    /// on an open device.
+    private var lastScan: HIDClientScan = .unavailable
+    /// When the last reply-triggered scan ran, on the `uptime` clock.
+    private var lastReplyScan: TimeInterval?
+    /// Who else holds the pad open. A seam for tests; reads the device at
+    /// call time, since `useEmulator` replaces it.
+    lazy var scanClients: @MainActor () -> HIDClientScan = { [weak self] in
+        self?.device.otherClients() ?? .unavailable
+    }
+    /// A monotonic clock for the reply-triggered scan limit. A seam for tests.
+    var uptime: @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    /// The least time between two scans triggered by foreign replies, so a
+    /// chatty client cannot turn every reply into a registry walk.
+    static let replyScanInterval: TimeInterval = 1
     private var warnedPermission = false
     /// Owned while the target is remote and the bridge runs.
     private var tunnel: SSHTunnel?
@@ -156,6 +178,9 @@ public final class BridgeController: ObservableObject {
             guard let self else { return }
             self.deviceConnected = false
             self.lastFingerprint = nil
+            // Who held a pad that is gone says nothing; the reopen rescans.
+            self.lastScan = .unavailable
+            self.updateContention()
             if self.isRunning { self.scheduleReopen() }
         }
         device.onTX = { [weak self] _, _, id in
@@ -181,20 +206,87 @@ public final class BridgeController: ObservableObject {
     /// reply id the bridge never issued, as another client's would.
     func noteResponse(id: Int) {
         // A reply to an id we never sent came from another client.
-        if issuedIDs.remove(id) == nil { contendingClient = true }
+        guard issuedIDs.remove(id) == nil else { return }
+        trafficSeen = true
+        // Scan to put a name on it, at most once a second. A reply within
+        // the window still raises the warning; it just keeps the last names.
+        let now = uptime()
+        if lastReplyScan.map({ now - $0 >= Self.replyScanInterval }) ?? true {
+            lastReplyScan = now
+            applyScan()
+        } else {
+            updateContention()
+        }
     }
 
-    /// The panel's Recheck: clears the warning, and repaints so our colours
-    /// replace whatever the other app left on the pad. Detection is passive,
-    /// so this proves nothing by itself — the warning comes back as soon as
-    /// the other app, if it is still there, sends to the pad again.
+    /// Re-reads who else holds the pad open, without repainting. The panel
+    /// calls this every time it opens, so the warning clears by itself once
+    /// the other app has quit.
+    public func scanContention() {
+        applyScan()
+    }
+
+    /// The panel's Recheck: forgets the replies seen so far, rescans, and
+    /// repaints so our colours replace whatever the other app left on the
+    /// pad. Without a usable scan this proves nothing by itself — the warning
+    /// comes back as soon as the other app, if it is still there, sends to
+    /// the pad again.
     public func recheckContention() async {
         // `issuedIDs` is left alone on purpose: a reply to one of our own
         // calls still in flight would otherwise look foreign and raise the
         // warning again at once.
-        contendingClient = false
+        trafficSeen = false
+        applyScan()
         guard isRunning else { return }
         await forceRepaint()
+    }
+
+    /// Scans the registry, if there is an open pad to scan. An off bridge
+    /// drives nothing, so its scan is `.unavailable` without asking.
+    private func applyScan() {
+        lastScan = isRunning && deviceConnected ? scanClients() : .unavailable
+        switch lastScan {
+        case .authoritative(let others), .advisory(let others):
+            // Nobody else holds the pad now, so whoever sent those replies
+            // has gone. Only a fresh scan clears: replies seen after it
+            // raise the warning again until the next one.
+            if others.isEmpty { trafficSeen = false }
+        case .unavailable:
+            break
+        }
+        updateContention()
+    }
+
+    /// The one place `contendingClient` is decided, from the replies seen
+    /// and the last scan:
+    ///
+    /// - unavailable: the replies alone (passive detection);
+    /// - authoritative (a dedicated vendor interface, USB): anyone else
+    ///   there can drive the lighting, so a non-empty list raises it;
+    /// - advisory (the pad's only interface, Bluetooth): others may only be
+    ///   listening for keys, so the list names but cannot raise.
+    ///
+    /// An empty list has already cleared the replies, in `applyScan()`.
+    private func updateContention() {
+        switch lastScan {
+        case .unavailable:
+            contenders = []
+            contendingClient = trafficSeen
+        case .authoritative(let others):
+            contenders = others
+            contendingClient = trafficSeen || !others.isEmpty
+        case .advisory(let others):
+            contenders = others
+            contendingClient = trafficSeen
+        }
+    }
+
+    /// Clears both signals; for `start()` and `stop()`.
+    private func resetContention() {
+        trafficSeen = false
+        lastScan = .unavailable
+        lastReplyScan = nil
+        updateContention()
     }
 
     // MARK: - Lifecycle
@@ -207,7 +299,7 @@ public final class BridgeController: ObservableObject {
         guard !isRunning else { return }
         isRunning = true
         lastError = nil
-        contendingClient = false
+        resetContention()
         keyBindings = KeyBindings.load()
 
         openingDevice = true
@@ -228,7 +320,7 @@ public final class BridgeController: ObservableObject {
         // Cleared after the teardown, whose lights-off calls wait on replies
         // that another client's may land among; a start() that came in
         // meanwhile owns the flag.
-        if !isRunning { contendingClient = false }
+        if !isRunning { resetContention() }
     }
 
     /// Points the pad at another Herdr server. Takes effect at once while
@@ -469,6 +561,9 @@ public final class BridgeController: ObservableObject {
             warnedPermission = false
             deviceName = device.info?.product ?? "Work Louder device"
             lastError = nil
+            // A client that was already holding the pad is seen now, not
+            // only once it next sends something.
+            applyScan()
         } catch {
             deviceConnected = false
             let message = error.localizedDescription
