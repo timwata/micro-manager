@@ -1,6 +1,6 @@
 # Fix plan: follow-up review of `main` (2026-10-10)
 
-Status: planned.
+Status: Phase 1 implemented; Phase 2 planned.
 
 Source: a whole-repo review of `main` at `b303213` (after all six PRs of
 `design/review-fixes.md` were merged). Build and tests were green at that
@@ -227,31 +227,82 @@ session.
 
 Branch `fix/followup-1-socket-lifetime` · PR title `fix: free herdr connections and survive closed sockets`
 
-- [ ] F1: `SocketConnection.readLoop()` clears `onLine`/`onClosed` after
+- [x] F1: `SocketConnection.readLoop()` clears `onLine`/`onClosed` after
       `onClosed` in its `defer`.
-- [ ] F1: `SocketConnection.open()` clears both callbacks on every failure
+- [x] F1: `SocketConnection.open()` clears both callbacks on every failure
       path.
-- [ ] F1: `finish` in `request` and `probe` still captures `conn` strongly
+- [x] F1: `finish` in `request` and `probe` still captures `conn` strongly
       (no weak capture; see F1).
-- [ ] F1 tests: `SocketConnectionLifetimeTests` with the three cases (reply,
+- [x] F1 tests: `SocketConnectionLifetimeTests` with the three cases (reply,
       `open()` failure, peer close); each mutation-checked.
-- [ ] F1 **verify**: `leaks` on the headless debug app, before and after,
+- [x] F1 **verify**: `leaks` on the headless debug app, before and after,
       with and (if possible) without a local Herdr; counts in Notes.
-- [ ] F2: `SO_NOSIGPIPE` set in `open()` right after `socket()`.
-- [ ] F2 test: close-at-once fake server plus a 1 MB write; mutation check
+- [x] F2: `SO_NOSIGPIPE` set in `open()` right after `socket()`.
+- [x] F2 test: close-at-once fake server plus a 1 MB write; mutation check
       (test runner killed by `SIGPIPE` without the fix) in Notes.
-- [ ] `SSHTunnelTests`, `BridgeReentrancyTests`, `HerdrClientRequestTests`
+- [x] `SSHTunnelTests`, `BridgeReentrancyTests`, `HerdrClientRequestTests`
       and `HerdrEventStreamTests` still pass.
-- [ ] Optional, if the session has the tools: TSan
+- [x] Optional, if the session has the tools: TSan
       (`env -u HERDR_SOCKET_PATH swift test --sanitize=thread --filter
       'SocketConnectionLifetimeTests|HerdrClientRequestTests|HerdrEventStreamTests'`)
       is clean; result in Notes.
-- [ ] In `design/review-fixes.md`, the leak entry under "Found during
+- [x] In `design/review-fixes.md`, the leak entry under "Found during
       implementation" points at this phase as fixed.
-- [ ] `swift build -c release` (zero warnings) and
+- [x] `swift build -c release` (zero warnings) and
       `env -u HERDR_SOCKET_PATH swift test` green.
 
 Notes:
+
+- **Shape of the `open()` fix.** The socket work moved into a private
+  `connect()`; `open()` wraps it, clears both callbacks in one `catch`
+  and starts the read loop only on success. That covers every failure
+  path at once, including the new one below, instead of clearing at
+  each `throw`.
+- **`SO_NOSIGPIPE` failure is an open failure.** If `setsockopt` fails,
+  `open()` closes the handle and throws `cannotConnect` rather than going
+  on with a socket that could kill the app. It is not expected to fail
+  on a fresh `AF_UNIX` socket.
+- **The F2 fake server cannot close "at once".** The first version of
+  `HangUpHerdrServer` closed right after `accept`, and the SIGPIPE test
+  passed even with `SO_NOSIGPIPE` removed. The cause was a race in the
+  test, not a masked signal (the runner's SIGPIPE disposition was
+  `SIG_DFL`, unblocked on the test thread): the client's read loop saw the
+  hang-up first and gave up the fd, so `write` returned at its `fd >= 0`
+  guard without touching the socket. The server now `poll`s until the
+  client's first bytes are pending (1 s cap), then closes without reading
+  them, so the 1 MB write is blocked when the peer goes away. The
+  peer-close lifetime test uses the same server and sends a request line
+  first, i.e. Herdr hanging up on an unread request.
+- **Mutation checks.** Each fix removed on its own, then restored:
+  - No clearing in `readLoop()`'s `defer`: the reply and peer-close tests
+    fail ("the connection outlived its last callback"); the `open()`
+    failure test still passes.
+  - No clearing in `open()`'s failure path: only the `open()` failure
+    test fails.
+  - No `SO_NOSIGPIPE`: the test runner exits with "unexpected signal
+    code 13" (SIGPIPE), in a separate `--filter` run, 10 runs out of 10.
+  - With the fixes, `SocketConnectionLifetimeTests` passed 30 runs out
+    of 30.
+- **`leaks` (verify).** `WL_EMULATE=1 .build/debug/WLMicroManager`, 15 s,
+  then `leaks <pid>`. "With Herdr" set `HERDR_SOCKET_PATH` to the running
+  local Herdr; "without" set it to a path that does not exist, which is
+  the `open()` failure path.
+
+  | run | before | after |
+  |---|---|---|
+  | with a local Herdr | 4 `ROOT CYCLE: <SocketConnection>` | 0 |
+  | without Herdr (`open()` fails) | 5 `ROOT CYCLE: <SocketConnection>` | 0 |
+
+  Fewer than one per 2.5 s poll before the fix, because a request's
+  `finish` is still reachable from its pending timeout for 5 s. That is
+  bounded, not a leak, and stays as it is. The remaining reports (about
+  290 entries, 14 KB, same before and after) are all
+  `NSXPCConnection` / `dispatch_mach_t` cycles for
+  `com.apple.linkd.autoShortcut` inside system frameworks, not app code.
+- **TSan** on `SocketConnectionLifetimeTests|HerdrClientRequestTests|HerdrEventStreamTests`:
+  9 tests, 0 failures, no ThreadSanitizer reports.
+- Full suite: 197 tests, 0 failures, 2 skipped. Release build in a clean
+  `--build-path`: zero warnings.
 
 ### Phase 2 — Device-side hygiene (F3, F4)
 
