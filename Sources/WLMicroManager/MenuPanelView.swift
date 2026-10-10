@@ -283,6 +283,15 @@ struct MenuPanelView: View {
                     RoundedRectangle(cornerRadius: 5)
                         .strokeBorder(Color.secondary.opacity(0.25), lineWidth: 0.5)
                 )
+                .overlay(
+                    // The key index, as in the Inspector. White with a dark
+                    // edge, so it reads on a pale lit key as well as a dark one.
+                    Text("\(index)")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.8), radius: 0.6)
+                        .shadow(color: .black.opacity(0.5), radius: 1.2)
+                )
         }
         .buttonStyle(.plain)
         .disabled(isUnavailable
