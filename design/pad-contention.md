@@ -161,7 +161,8 @@ extension WLDevice {
 `IOUserClientCreator` is not documented API. It has been stable for many
 macOS releases and `ioreg` shows it, but every failure (property missing,
 unexpected format) must degrade to `.unavailable` or to a client list
-without that entry, never to a crash or a false warning.
+without that entry, never to a crash or a false warning. A scan that does
+not see this process's own client is `.unavailable` too (Phase 2 Notes).
 
 #### Bridge and panel (Phase 3)
 
@@ -353,6 +354,18 @@ Notes:
   `pid `, `"uid 501, …"`; the first version was not caught); authoritative
   and advisory swapped → the live test fails; a closed device returns
   `.authoritative([])` → the emulator/closed test fails.
+- Review follow-up (PR #19): a scan that does not see this process's own
+  client is `.unavailable`, not an empty list. This process has just opened
+  the device, so a missing own entry means the walk did not understand the
+  registry: `IOUserClientCreator` gone or reformatted in a future macOS, the
+  clients hanging elsewhere (Bluetooth, unverified), or a stale service after
+  removal. `others(among:ownPID:)` returns nil then, and `scanClients` maps
+  it to `.unavailable`. **Phase 3's table relies on this:** an empty list
+  clears `trafficSeen`, and Phase 3 scans after every foreign reply, so a
+  broken scan returning `[]` would clear the warning as soon as it is raised.
+  `.authoritative([])` / `.advisory([])` are only returned when this
+  process's own client was seen. Mutation check: own-pid presence check
+  dropped → `testNoOwnPidIsNil` fails.
 - **Gate: Phase 3 goes ahead as designed.** On USB the property is present,
   the contenders (the app, the Input app) appear on the vendor interface by
   name, and the keyboard interface's listeners (Discord) do not. Bluetooth is

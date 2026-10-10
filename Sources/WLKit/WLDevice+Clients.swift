@@ -19,7 +19,9 @@ public struct HIDClient: Equatable, Sendable {
 /// counterpart to spotting a reply id we never issued: it also sees a client
 /// that has the pad open but is not sending anything right now.
 public enum HIDClientScan: Equatable, Sendable {
-    /// Nothing to scan: the emulator, no open device, or a registry error.
+    /// Nothing to scan: the emulator, no open device, a registry error, or a
+    /// scan that did not see this process's own client (so it did not
+    /// understand the registry, and an empty list would be a guess).
     case unavailable
     /// The opened device is a dedicated vendor interface (its primary usage
     /// page is 0xFF00): every other client there can drive the lighting.
@@ -43,7 +45,10 @@ extension WLDevice {
     ///
     /// `IOUserClientCreator` is not documented API, so anything unexpected
     /// drops that entry or the whole scan to `.unavailable`, never to a
-    /// client that is not there.
+    /// client that is not there. This process has just opened the device, so
+    /// a walk that does not find its own client has failed (the property
+    /// changed format, the clients hang elsewhere, the service is stale):
+    /// that is `.unavailable` too, not an empty list.
     static func scanClients(of device: IOHIDDevice, vendorInterface: Bool) -> HIDClientScan {
         // A Get function: the service is not retained, so it is not released.
         let service = IOHIDDeviceGetService(device)
@@ -69,7 +74,8 @@ extension WLDevice {
             entries.append(entry)
         }
 
-        let clients = others(among: entries, ownPID: getpid()).map { client in
+        guard let others = others(among: entries, ownPID: getpid()) else { return .unavailable }
+        let clients = others.map { client in
             HIDClient(
                 pid: client.pid,
                 name: NSRunningApplication(processIdentifier: client.pid)?.localizedName ?? client.name
@@ -92,8 +98,10 @@ extension WLDevice {
 
     /// Drops this process (it may hold several clients: `IOHIDManagerOpen`
     /// opens every matching interface) and keeps one entry per pid, the
-    /// first, in registry order.
-    static func others(among entries: [(pid: pid_t, name: String)], ownPID: pid_t) -> [HIDClient] {
+    /// first, in registry order. Nil when no entry is this process's: it has
+    /// the device open, so the entries cannot be the whole picture.
+    static func others(among entries: [(pid: pid_t, name: String)], ownPID: pid_t) -> [HIDClient]? {
+        guard entries.contains(where: { $0.pid == ownPID }) else { return nil }
         var seen: Set<pid_t> = [ownPID]
         return entries.compactMap { entry in
             seen.insert(entry.pid).inserted ? HIDClient(pid: entry.pid, name: entry.name) : nil

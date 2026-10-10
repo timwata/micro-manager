@@ -57,7 +57,14 @@ final class HIDClientScanTests: XCTestCase {
             [HIDClient(pid: 200, name: "input"), HIDClient(pid: 300, name: "Inspector")]
         )
         XCTAssertEqual(WLDevice.others(among: [(100, "MicroManager")], ownPID: 100), [])
-        XCTAssertEqual(WLDevice.others(among: [], ownPID: 100), [])
+    }
+
+    /// This process has the device open, so a walk that does not find its
+    /// own client has not understood the registry: nil (the scan becomes
+    /// `.unavailable`), never an empty list that would clear the warning.
+    func testNoOwnPidIsNil() {
+        XCTAssertNil(WLDevice.others(among: [], ownPID: 100))
+        XCTAssertNil(WLDevice.others(among: [(200, "input"), (300, "Inspector")], ownPID: 100))
     }
 
     /// The emulator has no registry entry to scan, and neither has a device
