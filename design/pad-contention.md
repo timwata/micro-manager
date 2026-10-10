@@ -1,6 +1,6 @@
 # Pad contention: a warning that can clear
 
-Status: planned.
+Status: Phases 1 and 2 implemented.
 
 The panel warns "Another app is also driving this pad — colours may fight."
 when something else talks to the pad. Once raised, the warning stays until
@@ -276,19 +276,19 @@ Notes:
 
 Branch `feat/contention-2-registry-scan` · PR title `feat: list the other processes holding the pad open`
 
-- [ ] `HIDClient`, `HIDClientScan` and `WLDevice.otherClients()` as in
+- [x] `HIDClient`, `HIDClientScan` and `WLDevice.otherClients()` as in
       Part 1; the emulator and a closed device return `.unavailable`.
-- [ ] Pure `parseCreator(_:)`, with tests: a normal value, a cut name
+- [x] Pure `parseCreator(_:)`, with tests: a normal value, a cut name
       (`"pid 24023, Discord Helper ("`), a name with commas, no comma,
       a non-numeric pid, an empty string.
-- [ ] Own pid dropped and pids de-duplicated, tested through a pure helper
+- [x] Own pid dropped and pids de-duplicated, tested through a pure helper
       that takes parsed entries plus the own pid.
-- [ ] Every `io_object_t` from the iterator released (review it; `leaks` on
+- [x] Every `io_object_t` from the iterator released (review it; `leaks` on
       a loop of 1,000 scans in a live test if a pad is present).
-- [ ] `LiveDeviceClientsTests`: with a pad, `otherClients()` is not
+- [x] `LiveDeviceClientsTests`: with a pad, `otherClients()` is not
       `.unavailable` and never lists this test process. It prints the scan.
       Skips without a pad, like `LiveDeviceTests`.
-- [ ] **verify** (pad on USB): run the live test while the installed
+- [x] **verify** (pad on USB): run the live test while the installed
       MicroManager.app runs. The test process holds the pad as well, so the
       app must appear in the scan as an `.authoritative` client by name.
       Record the output.
@@ -298,21 +298,68 @@ Branch `feat/contention-2-registry-scan` · PR title `feat: list the other proce
 - [ ] **verify** (user check if no Bluetooth pad in-session): over
       Bluetooth the scan is `.advisory`; record which clients appear with no
       other app driving the pad (keyboard listeners such as Discord).
-- [ ] Scan duration measured (Notes). If it is over ~5 ms, say so: Phase 3
+- [x] Scan duration measured (Notes). If it is over ~5 ms, say so: Phase 3
       runs it on the main actor.
-- [ ] **Gate:** Notes state whether Phase 3 goes ahead as designed. If any
+- [x] **Gate:** Notes state whether Phase 3 goes ahead as designed. If any
       verify above fails (a contender does not appear, the property is
       missing, Bluetooth lists unrelated clients even in `.authoritative`
       cases), write the adjusted Phase 3 design into this file's Part 1
       first, or record that C is dropped and Phase 1 is the final state.
-- [ ] `docs/hacking.md` "You are not the only client": add the IORegistry
+- [x] `docs/hacking.md` "You are not the only client": add the IORegistry
       check (`ioreg -r -n "Creator Micro 2" -l -w0`, `IOUserClientCreator`
       on the vendor interface) as the active way to see who else holds the
       pad.
-- [ ] `swift build -c release` (zero warnings) and
+- [x] `swift build -c release` (zero warnings) and
       `env -u HERDR_SOCKET_PATH swift test` green.
 
 Notes:
+
+- The scan lives in `WLDevice+Clients.swift` as the internal static
+  `WLDevice.scanClients(of:vendorInterface:)`; `otherClients()` sits in
+  `WLDevice.swift` because the opened `IOHIDDevice` is private there. The
+  pure helpers are `WLDevice.parseCreator(_:)` and
+  `WLDevice.others(among:ownPID:)` (keeps the first entry per pid, in
+  registry order). `HIDClient` has a public init, for Phase 3's
+  `scanClients` seam.
+- `otherClients()` checks only for an open `IOHIDDevice`: the emulator never
+  opens one, so it is `.unavailable` without a check of its own.
+- `parseCreator` takes everything after the *first* comma as the name and
+  leaves the pid to `pid_t(_:)` plus `pid > 0`; the name is trimmed of
+  surrounding spaces.
+- Leak check: `leaks` was not used. A leaked `io_object_t` is a Mach send
+  right, not a heap block, so `leaks` cannot see it. The live test instead
+  sums this task's send-right user references around 1,000 scans and allows
+  growth under 100. Measured: 59 → 59.
+- **verify (USB), 2026-10-10**, pad on USB, installed app running with the
+  bridge on, Work Louder's Input app open:
+  `transport: USB, usage page: 65280` and
+  `authoritative([HIDClient(pid: 24802, name: "input"), HIDClient(pid: 30335, name: "Micro Manager")])`.
+  The app is listed by its `NSRunningApplication` name ("Micro Manager";
+  the registry says "MicroManager"); the test process is not listed. The
+  Input app appeared while open; its disappearing on quit, and the
+  Inspector and Codex, are left as user checks (the Input app was the
+  user's own, and was not quit in-session).
+- Bluetooth was not checked in-session (the pad was on USB): user check.
+- Scan duration: about 0.5 ms for the first scan in a fresh test process
+  (three runs: 0.49–0.52 ms), 0.077 ms on average over 1,000 warm scans. Fine
+  on the main actor.
+- Mutation checks, each restored afterwards: child not released → the leak
+  test fails (+4,000 references); iterator not released → it fails
+  (+1,000); own pid kept → the pure test and the live test ("this process
+  listed itself") fail; no de-duplication → the pure test fails; name split
+  at the last comma → the commas test fails; negative pid accepted → the
+  reject test fails; no `pid ` prefix check → the reject test fails (only
+  after its "another prefix" case was changed to the same length as
+  `pid `, `"uid 501, …"`; the first version was not caught); authoritative
+  and advisory swapped → the live test fails; a closed device returns
+  `.authoritative([])` → the emulator/closed test fails.
+- **Gate: Phase 3 goes ahead as designed.** On USB the property is present,
+  the contenders (the app, the Input app) appear on the vendor interface by
+  name, and the keyboard interface's listeners (Discord) do not. Bluetooth is
+  unverified, but the table in Part 1 already keeps `.advisory` from raising
+  the warning: if keyboard listeners always show up there, an advisory scan
+  only ever labels, and Bluetooth stays at Phase 1 behaviour. If the
+  Bluetooth user check shows otherwise, record it here before Phase 3.
 
 ### Phase 3 — Bridge and panel (option C, part 2)
 
