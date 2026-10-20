@@ -56,6 +56,7 @@ struct MenuPanelView: View {
             footer
         }
         .frame(width: 300)
+        .fixedSize(horizontal: false, vertical: true)
         // Re-read on every opening, so a config edit shows up without a
         // relaunch. The window may be kept alive between openings, in which
         // case only becoming key marks a new one — this panel's window, not
@@ -65,11 +66,31 @@ struct MenuPanelView: View {
         // once the other app has quit.
         .onAppear { reloadRemotes(); bridge.scanContention() }
         .background(WindowReader { panel.window = $0 })
+        // The status-item window does not always follow its content when it
+        // shrinks (Off → On → Off), leaving it tall with the panel floating
+        // in the middle. Re-fit it, top edge fixed, on every height change.
+        .background(GeometryReader { geo in
+            Color.clear
+                .onAppear { fitWindowToContent(geo.size.height) }
+                .onChange(of: geo.size.height) { h in
+                    DispatchQueue.main.async { fitWindowToContent(h) }
+                }
+        })
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
             guard let window = note.object as? NSWindow, window === panel.window else { return }
             reloadRemotes()
             bridge.scanContention()
         }
+    }
+
+    private func fitWindowToContent(_ wanted: CGFloat) {
+        guard let window = panel.window else { return }
+        let current = window.contentRect(forFrameRect: window.frame).height
+        guard wanted > 0, abs(wanted - current) > 1 else { return }
+        let top = window.frame.maxY
+        window.setContentSize(NSSize(width: window.contentRect(forFrameRect: window.frame).width,
+                                     height: wanted))
+        window.setFrameTopLeftPoint(NSPoint(x: window.frame.minX, y: top))
     }
 
     /// Names the other apps when the registry scan knew them.
